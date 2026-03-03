@@ -45,7 +45,9 @@ jobs:
         uses: astral-sh/setup-uv@v4
 
       - name: Export locked dependencies
-        run: uv export --frozen --format requirements.txt --no-hashes > requirements.txt
+        run: |
+          uv export --frozen --format requirements-txt --no-hashes > requirements.txt
+          mv requirements.txt.tmp requirements.txt
 
       - name: Run pip-audit
         run: |
