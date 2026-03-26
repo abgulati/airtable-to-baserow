@@ -20,6 +20,12 @@ from dotenv import load_dotenv
 
 LOGGER = logging.getLogger("airtable_baserow_migrator")
 
+BASEROW_SELECT_COLORS = [
+    "light-blue", "light-green", "light-orange", "light-red",
+    "light-yellow", "light-gray", "light-cyan", "light-pink",
+    "blue", "green", "orange", "red", "yellow", "gray",
+]
+
 
 def _to_bool(raw: str) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -107,10 +113,13 @@ class Config:
 
 
 class MappingStore:
-    def __init__(self, db_path: Path) -> None:
-        self.conn = sqlite3.connect(str(db_path))
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA synchronous=NORMAL;")
+    def __init__(self, db_path: Path, in_memory: bool = False) -> None:
+        if in_memory:
+            self.conn = sqlite3.connect(":memory:")
+        else:
+            self.conn = sqlite3.connect(str(db_path))
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -290,7 +299,7 @@ class MappingStore:
 class Migrator:
     def __init__(self, config: Config) -> None:
         self.config = config
-        self.mapping = MappingStore(config.sqlite_path)
+        self.mapping = MappingStore(config.sqlite_path, in_memory=config.dry_run)
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "airtable-baserow-migrator/1.0"})
         self.attachments_dir = config.attachments_dir
@@ -499,14 +508,20 @@ class Migrator:
             choices = options.get("choices", [])
             return (
                 "single_select",
-                {"select_options": [{"value": c.get("name", "Option")} for c in choices]},
+                {"select_options": [
+                    {"value": c.get("name", "Option"), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
+                    for i, c in enumerate(choices)
+                ]},
                 False,
             )
         if ftype == "multipleSelects":
             choices = options.get("choices", [])
             return (
                 "multiple_select",
-                {"select_options": [{"value": c.get("name", "Option")} for c in choices]},
+                {"select_options": [
+                    {"value": c.get("name", "Option"), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
+                    for i, c in enumerate(choices)
+                ]},
                 False,
             )
         if ftype == "multipleAttachments":
@@ -535,7 +550,7 @@ class Migrator:
         payload = self.baserow_management_request(
             "POST",
             f"/api/applications/workspace/{self.config.baserow_workspace_id}/",
-            {200},
+            {200, 201},
             {
                 "name": _sanitize_name(base.get("name", base_id), base_id),
                 "type": "database",
