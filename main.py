@@ -724,11 +724,11 @@ class Migrator:
 
         existing_fields = self.get_baserow_fields(baserow_table_id)
         for ef in existing_fields:
-            if ef.get("name") == baserow_field_name and ef.get("type") == "link_row":
+            if ef.get("name") == baserow_field_name:
                 field_id = int(ef["id"])
                 LOGGER.info(
-                    "Link field '%s' already exists in Baserow table %s (id=%s), adopting it",
-                    baserow_field_name, baserow_table_id, field_id,
+                    "Field '%s' already exists in Baserow table %s (id=%s, type=%s), adopting as link field",
+                    baserow_field_name, baserow_table_id, field_id, ef.get("type"),
                 )
                 self.mapping.set_field(
                     airtable_table_id,
