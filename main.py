@@ -420,7 +420,7 @@ class Migrator:
             )
             if resp.status_code in expected_statuses:
                 return resp
-            if resp.status_code in {429, 500, 502, 503, 504} and attempt < 5:
+            if resp.status_code in {409, 429, 500, 502, 503, 504} and attempt < 5:
                 sleep_seconds = 2 ** attempt
                 LOGGER.warning("Retrying %s after HTTP %s in %ss", url, resp.status_code, sleep_seconds)
                 time.sleep(sleep_seconds)
