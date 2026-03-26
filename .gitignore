@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+.env
+*.db
+attachments_cache/
+migration_report.json
