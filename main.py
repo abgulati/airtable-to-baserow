@@ -730,6 +730,22 @@ class Migrator:
         LOGGER.info("Created link-row field '%s' in table %s", baserow_field_name, baserow_table_id)
         return field_id
 
+    def _find_reverse_link_field(
+        self, baserow_table_id: int, target_baserow_table_id: int, preferred_name: str
+    ) -> Optional[int]:
+        """Find the auto-created reverse link_row field on baserow_table_id that points to target_baserow_table_id."""
+        if self.config.dry_run:
+            return self._next_fake_id()
+        fields = self.get_baserow_fields(baserow_table_id)
+        for f in fields:
+            if f.get("type") == "link_row" and f.get("link_row_table_id") == target_baserow_table_id:
+                return int(f["id"])
+        LOGGER.warning(
+            "Could not find auto-created reverse link field on table %s pointing to %s",
+            baserow_table_id, target_baserow_table_id,
+        )
+        return None
+
     def iter_airtable_records(self, base_id: str, table_id: str) -> Iterable[Dict[str, Any]]:
         offset = None
         while True:
@@ -1045,6 +1061,10 @@ class Migrator:
                     )
 
         # Second pass for relation fields.
+        # Track created links as (baserow_source, baserow_target) so we can
+        # detect reverse links that Baserow auto-creates.
+        created_link_pairs: set[tuple[int, int]] = set()
+
         for airtable_table_id, baserow_table_id, field, baserow_field_name, linked_target in deferred_links:
             target_baserow_table_id = self.mapping.get_table(linked_target)
             if not target_baserow_table_id:
@@ -1064,6 +1084,30 @@ class Migrator:
                     },
                 )
                 continue
+
+            reverse_pair = (target_baserow_table_id, baserow_table_id)
+            if reverse_pair in created_link_pairs:
+                # The forward link already created a reverse field on this table.
+                # Find the auto-created reverse field via the Baserow API.
+                reverse_field_id = self._find_reverse_link_field(
+                    baserow_table_id, target_baserow_table_id, baserow_field_name
+                )
+                self.mapping.set_field(
+                    airtable_table_id,
+                    field["id"],
+                    field.get("name", field["id"]),
+                    reverse_field_id,
+                    baserow_field_name,
+                    "link_row",
+                    linked_target,
+                )
+                if reverse_field_id:
+                    LOGGER.info(
+                        "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
+                        baserow_field_name, reverse_field_id, baserow_table_id,
+                    )
+                continue
+
             self.create_link_field_if_needed(
                 airtable_table_id,
                 baserow_table_id,
@@ -1072,6 +1116,7 @@ class Migrator:
                 target_baserow_table_id,
                 linked_target,
             )
+            created_link_pairs.add((baserow_table_id, target_baserow_table_id))
 
         return plan
 
