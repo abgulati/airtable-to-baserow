@@ -722,6 +722,7 @@ class Migrator:
             )
             return fake_id
 
+        is_self_ref = baserow_table_id == target_baserow_table_id
         payload = self.baserow_management_request(
             "POST",
             f"/api/database/fields/table/{baserow_table_id}/",
@@ -730,7 +731,7 @@ class Migrator:
                 "name": baserow_field_name,
                 "type": "link_row",
                 "link_row_table": target_baserow_table_id,
-                "has_related_field": True,
+                "has_related_field": not is_self_ref,
             },
         )
         field_id = int(payload["id"])
