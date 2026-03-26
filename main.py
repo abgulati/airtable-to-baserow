@@ -470,7 +470,7 @@ class Migrator:
         filtered = [
             b
             for b in bases
-            if b.get("workspaceId") == self.config.airtable_workspace_id
+            if (b.get("workspaceId") is None or b.get("workspaceId") == self.config.airtable_workspace_id)
             and (self.config.airtable_base_ids is None or b.get("id") in self.config.airtable_base_ids)
         ]
         LOGGER.info("Discovered %s base(s) in Airtable workspace", len(filtered))
