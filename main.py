@@ -722,6 +722,25 @@ class Migrator:
             )
             return fake_id
 
+        existing_fields = self.get_baserow_fields(baserow_table_id)
+        for ef in existing_fields:
+            if ef.get("name") == baserow_field_name and ef.get("type") == "link_row":
+                field_id = int(ef["id"])
+                LOGGER.info(
+                    "Link field '%s' already exists in Baserow table %s (id=%s), adopting it",
+                    baserow_field_name, baserow_table_id, field_id,
+                )
+                self.mapping.set_field(
+                    airtable_table_id,
+                    airtable_field["id"],
+                    airtable_field.get("name", airtable_field["id"]),
+                    field_id,
+                    baserow_field_name,
+                    "link_row",
+                    linked_target_airtable_table_id,
+                )
+                return field_id
+
         is_self_ref = baserow_table_id == target_baserow_table_id
         payload = self.baserow_management_request(
             "POST",
