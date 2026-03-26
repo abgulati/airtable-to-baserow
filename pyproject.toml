@@ -5,7 +5,6 @@ description = "A tool to securely migrate data from AirTable to Baserow"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "pyairtable>=3.3.0",
     "python-dotenv>=1.2.2",
     "requests>=2.32.5",
 ]
