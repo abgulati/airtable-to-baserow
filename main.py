@@ -1147,6 +1147,34 @@ class Migrator:
                     )
                 continue
 
+            source_base_id = self.mapping.get_base_id_for_table(airtable_table_id)
+            target_base_id = self.mapping.get_base_id_for_table(linked_target)
+            source_db = self.mapping.get_base(source_base_id) if source_base_id else None
+            target_db = self.mapping.get_base(target_base_id) if target_base_id else None
+            if source_db and target_db and source_db != target_db:
+                LOGGER.warning(
+                    "Skipping cross-database link field '%s' on table %s: "
+                    "source db %s != target db %s (Baserow requires same database)",
+                    field.get("name"), airtable_table_id, source_db, target_db,
+                )
+                self._add_error(
+                    "create_link_field",
+                    "Cross-database link not supported in Baserow",
+                    {
+                        "airtable_table_id": airtable_table_id,
+                        "linked_target_airtable_table_id": linked_target,
+                        "field_name": field.get("name"),
+                        "source_baserow_db": source_db,
+                        "target_baserow_db": target_db,
+                    },
+                )
+                self.mapping.set_field(
+                    airtable_table_id, field["id"],
+                    field.get("name", field["id"]),
+                    None, baserow_field_name, "link_row", linked_target,
+                )
+                continue
+
             self.create_link_field_if_needed(
                 airtable_table_id,
                 baserow_table_id,
