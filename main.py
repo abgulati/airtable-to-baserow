@@ -535,7 +535,7 @@ class Migrator:
         payload = self.baserow_management_request(
             "POST",
             "/api/applications/",
-            {200},
+            {200, 201},
             {
                 "name": _sanitize_name(base.get("name", base_id), base_id),
                 "workspace": self.config.baserow_workspace_id,
@@ -573,7 +573,7 @@ class Migrator:
         payload = self.baserow_management_request(
             "POST",
             f"/api/database/tables/database/{db_id}/",
-            {200},
+            {200, 201},
             {
                 "name": _sanitize_name(table.get("name", table["id"]), table["id"]),
                 "data": [{"name": first_field_name, "type": "text"}],
@@ -634,7 +634,7 @@ class Migrator:
         payload = self.baserow_management_request(
             "POST",
             f"/api/database/fields/table/{baserow_table_id}/",
-            {200},
+            {200, 201},
             body,
         )
         field_id = int(payload["id"])
@@ -692,7 +692,7 @@ class Migrator:
         payload = self.baserow_management_request(
             "POST",
             f"/api/database/fields/table/{baserow_table_id}/",
-            {200},
+            {200, 201},
             {
                 "name": baserow_field_name,
                 "type": "link_row",
@@ -763,7 +763,7 @@ class Migrator:
                 "POST",
                 url,
                 headers=headers,
-                expected_statuses={200},
+                expected_statuses={200, 201},
                 files={"file": (file_path.name, fh)},
             )
         table_report["files_uploaded_to_baserow"] += 1
@@ -854,7 +854,7 @@ class Migrator:
             row = self.baserow_row_request(
                 "POST",
                 f"/api/database/rows/table/{baserow_table_id}/?user_field_names=true",
-                {200},
+                {200, 201},
                 row_payload,
             )
             self.mapping.set_record(airtable_table_id, airtable_record_id, int(row["id"]))
