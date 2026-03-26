@@ -534,11 +534,10 @@ class Migrator:
             return fake_id
         payload = self.baserow_management_request(
             "POST",
-            "/api/applications/",
-            {200, 201},
+            f"/api/applications/workspace/{self.config.baserow_workspace_id}/",
+            {200},
             {
                 "name": _sanitize_name(base.get("name", base_id), base_id),
-                "workspace": self.config.baserow_workspace_id,
                 "type": "database",
             },
         )
