@@ -505,21 +505,21 @@ class Migrator:
             include_time = "timeFormat" in options or ftype in {"dateTime", "createdTime", "lastModifiedTime"}
             return "date", {"date_include_time": include_time}, False
         if ftype == "singleSelect":
-            choices = options.get("choices", [])
+            choices = [c for c in options.get("choices", []) if (c.get("name") or "").strip()]
             return (
                 "single_select",
                 {"select_options": [
-                    {"value": c.get("name", "Option"), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
+                    {"value": c["name"].strip(), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
                     for i, c in enumerate(choices)
                 ]},
                 False,
             )
         if ftype == "multipleSelects":
-            choices = options.get("choices", [])
+            choices = [c for c in options.get("choices", []) if (c.get("name") or "").strip()]
             return (
                 "multiple_select",
                 {"select_options": [
-                    {"value": c.get("name", "Option"), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
+                    {"value": c["name"].strip(), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
                     for i, c in enumerate(choices)
                 ]},
                 False,
