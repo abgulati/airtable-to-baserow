@@ -953,7 +953,10 @@ class Migrator:
         if not baserow_table_id:
             return
         fields_meta = self.mapping.get_fields_for_table(airtable_table_id)
-        link_fields = [item for item in fields_meta if item["baserow_field_type"] == "link_row"]
+        link_fields = [
+            item for item in fields_meta
+            if item["baserow_field_type"] == "link_row" and item["baserow_field_id"] is not None
+        ]
         if not link_fields:
             return
         link_fields_by_name = {item["airtable_field_name"]: item for item in link_fields}
