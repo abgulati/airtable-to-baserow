@@ -962,14 +962,17 @@ class Migrator:
 
         # Verify against actual Baserow field types to avoid patching
         # adopted fields that aren't really link_row in Baserow.
+        # Also build a map from field ID to actual Baserow field name,
+        # since the name in our mapping may differ from what Baserow has.
+        actual_link_field_names: Dict[int, str] = {}
         if not self.config.dry_run:
             actual_fields = self.get_baserow_fields(baserow_table_id)
-            actual_link_field_ids = {
-                int(f["id"]) for f in actual_fields if f.get("type") == "link_row"
+            actual_link_field_names = {
+                int(f["id"]): f["name"] for f in actual_fields if f.get("type") == "link_row"
             }
             link_fields = [
                 item for item in link_fields
-                if item["baserow_field_id"] in actual_link_field_ids
+                if item["baserow_field_id"] in actual_link_field_names
             ]
         if not link_fields:
             return
@@ -995,7 +998,8 @@ class Migrator:
                     target_row_id = self.mapping.get_record(target_airtable_table_id, linked_airtable_record_id)
                     if target_row_id:
                         target_row_ids.append(target_row_id)
-                patch_payload[mapped["baserow_field_name"]] = target_row_ids
+                real_name = actual_link_field_names.get(mapped["baserow_field_id"], mapped["baserow_field_name"])
+                patch_payload[real_name] = target_row_ids
 
             if not patch_payload:
                 continue
