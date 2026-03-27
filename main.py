@@ -959,6 +959,21 @@ class Migrator:
         ]
         if not link_fields:
             return
+
+        # Verify against actual Baserow field types to avoid patching
+        # adopted fields that aren't really link_row in Baserow.
+        if not self.config.dry_run:
+            actual_fields = self.get_baserow_fields(baserow_table_id)
+            actual_link_field_ids = {
+                int(f["id"]) for f in actual_fields if f.get("type") == "link_row"
+            }
+            link_fields = [
+                item for item in link_fields
+                if item["baserow_field_id"] in actual_link_field_ids
+            ]
+        if not link_fields:
+            return
+
         link_fields_by_name = {item["airtable_field_name"]: item for item in link_fields}
         patched = 0
 
