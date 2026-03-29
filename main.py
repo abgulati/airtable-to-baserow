@@ -59,6 +59,8 @@ class Config:
     baserow_management_token: str
     baserow_management_token_type: str
     baserow_database_token: Optional[str]
+    baserow_refresh_token: Optional[str]
+    max_token_refreshes: int
     sqlite_path: Path
     attachments_dir: Path
     request_timeout: int
@@ -102,6 +104,8 @@ class Config:
             baserow_management_token=required["BASEROW_MANAGEMENT_TOKEN"],
             baserow_management_token_type=token_type,
             baserow_database_token=os.getenv("BASEROW_DATABASE_TOKEN", "").strip() or None,
+            baserow_refresh_token=os.getenv("BASEROW_REFRESH_TOKEN", "").strip() or None,
+            max_token_refreshes=int(os.getenv("MAX_TOKEN_REFRESHES", "3")),
             sqlite_path=Path(os.getenv("SQLITE_PATH", "id_mapping.db")),
             attachments_dir=Path(os.getenv("ATTACHMENTS_DIR", "attachments_cache")),
             request_timeout=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "60")),
@@ -307,6 +311,10 @@ class Migrator:
         self._fake_id_counter = 10_000
         self.base_names: Dict[str, str] = {}
         self.table_names: Dict[str, str] = {}
+        self._management_token = config.baserow_management_token
+        self._refresh_token = config.baserow_refresh_token
+        self._token_type = config.baserow_management_token_type
+        self._token_refreshes_remaining = config.max_token_refreshes
         self.report: Dict[str, Any] = {
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
@@ -394,7 +402,7 @@ class Migrator:
 
     def _baserow_management_headers(self, content_type_json: bool = True) -> Dict[str, str]:
         headers = {
-            "Authorization": f"{self.config.baserow_management_token_type} {self.config.baserow_management_token}"
+            "Authorization": f"{self._token_type} {self._management_token}"
         }
         if content_type_json:
             headers["Content-Type"] = "application/json"
@@ -405,6 +413,32 @@ class Migrator:
             return {"Authorization": f"Token {self.config.baserow_database_token}"}
         return self._baserow_management_headers(content_type_json=False)
 
+    def _refresh_access_token(self) -> bool:
+        """Use the refresh token to obtain a new JWT access token. Returns True on success."""
+        if not self._refresh_token or self._token_type != "JWT":
+            return False
+        if self._token_refreshes_remaining <= 0:
+            LOGGER.warning("Token refresh limit reached, no more refreshes allowed.")
+            return False
+        LOGGER.info("Attempting to refresh JWT access token (%s refresh(es) remaining)...", self._token_refreshes_remaining)
+        try:
+            resp = self.session.post(
+                f"{self.config.baserow_url}/api/user/token-refresh/",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps({"refresh_token": self._refresh_token}),
+                timeout=self.config.request_timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                self._management_token = data["access_token"]
+                self._token_refreshes_remaining -= 1
+                LOGGER.info("Successfully refreshed JWT access token. %s refresh(es) remaining.", self._token_refreshes_remaining)
+                return True
+            LOGGER.warning("Token refresh failed with status %s: %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            LOGGER.warning("Token refresh request failed: %s", exc)
+        return False
+
     def _request_with_retries(
         self,
         method: str,
@@ -413,6 +447,7 @@ class Migrator:
         expected_statuses: Iterable[int],
         **kwargs: Any,
     ) -> requests.Response:
+        refreshed_this_call = False
         for attempt in range(1, 6):
             resp = self.session.request(
                 method=method,
@@ -423,6 +458,12 @@ class Migrator:
             )
             if resp.status_code in expected_statuses:
                 return resp
+            if resp.status_code == 401 and not refreshed_this_call:
+                if self._refresh_access_token():
+                    refreshed_this_call = True
+                    headers = {k: v for k, v in headers.items()}
+                    headers["Authorization"] = f"{self._token_type} {self._management_token}"
+                    continue
             if resp.status_code in {409, 429, 500, 502, 503, 504} and attempt < 5:
                 sleep_seconds = 2 ** attempt
                 LOGGER.warning("Retrying %s after HTTP %s in %ss", url, resp.status_code, sleep_seconds)
