@@ -326,6 +326,9 @@ class Migrator:
                 "attachments_reused_from_cache": 0,
                 "files_uploaded_to_baserow": 0,
                 "files_failed": 0,
+                "rows_failed": 0,
+                "fields_failed": 0,
+                "link_patches_failed": 0,
             },
         }
 
@@ -901,9 +904,10 @@ class Migrator:
                     )
             return uploaded_files
         if baserow_type in {"single_select"}:
-            return str(value) if value is not None else None
+            v = str(value).strip() if value is not None else None
+            return v if v else None
         if baserow_type in {"multiple_select"}:
-            return [str(v) for v in (value or [])]
+            return [str(v) for v in (value or []) if str(v).strip()]
         if baserow_type == "number":
             return value
         if baserow_type == "boolean":
@@ -956,28 +960,38 @@ class Migrator:
                 continue
 
             try:
-                row = self.baserow_row_request(
-                    "POST",
-                    f"/api/database/rows/table/{baserow_table_id}/?user_field_names=true",
-                    {200, 201},
-                    row_payload,
-                )
-            except RuntimeError as exc:
-                if "not a valid select option" in str(exc).lower():
-                    LOGGER.info("Missing select option detected, adding options and retrying row")
-                    self._ensure_select_options(baserow_table_id, row_payload)
+                try:
                     row = self.baserow_row_request(
                         "POST",
                         f"/api/database/rows/table/{baserow_table_id}/?user_field_names=true",
                         {200, 201},
                         row_payload,
                     )
-                else:
-                    raise
-            self.mapping.set_record(airtable_table_id, airtable_record_id, int(row["id"]))
-            created += 1
-            if created % self.config.batch_size == 0:
-                LOGGER.info("Table %s: created %s rows", airtable_table_id, created)
+                except RuntimeError as exc:
+                    if "not a valid select option" in str(exc).lower():
+                        LOGGER.info("Missing select option detected, adding options and retrying row")
+                        self._ensure_select_options(baserow_table_id, row_payload)
+                        row = self.baserow_row_request(
+                            "POST",
+                            f"/api/database/rows/table/{baserow_table_id}/?user_field_names=true",
+                            {200, 201},
+                            row_payload,
+                        )
+                    else:
+                        raise
+                self.mapping.set_record(airtable_table_id, airtable_record_id, int(row["id"]))
+                created += 1
+                if created % self.config.batch_size == 0:
+                    LOGGER.info("Table %s: created %s rows", airtable_table_id, created)
+            except Exception as exc:
+                self.report["totals"]["rows_failed"] += 1
+                table_report.setdefault("rows_failed", 0)
+                table_report["rows_failed"] += 1
+                self._add_error(
+                    "create_row",
+                    str(exc)[:300],
+                    {"airtable_table_id": airtable_table_id, "airtable_record_id": airtable_record_id},
+                )
 
         table_report["rows_created"] += created
         table_report["rows_skipped_existing"] += skipped
@@ -1060,15 +1074,23 @@ class Migrator:
                 )
                 continue
 
-            self.baserow_row_request(
-                "PATCH",
-                f"/api/database/rows/table/{baserow_table_id}/{baserow_row_id}/?user_field_names=true",
-                {200},
-                patch_payload,
-            )
-            patched += 1
-            if patched % self.config.batch_size == 0:
-                LOGGER.info("Table %s: patched %s rows with link values", airtable_table_id, patched)
+            try:
+                self.baserow_row_request(
+                    "PATCH",
+                    f"/api/database/rows/table/{baserow_table_id}/{baserow_row_id}/?user_field_names=true",
+                    {200},
+                    patch_payload,
+                )
+                patched += 1
+                if patched % self.config.batch_size == 0:
+                    LOGGER.info("Table %s: patched %s rows with link values", airtable_table_id, patched)
+            except Exception as exc:
+                self.report["totals"]["link_patches_failed"] += 1
+                self._add_error(
+                    "patch_links",
+                    str(exc)[:300],
+                    {"airtable_table_id": airtable_table_id, "baserow_row_id": baserow_row_id},
+                )
         table_report["rows_patched_links"] += patched
         self.report["totals"]["rows_patch_links"] += patched
         LOGGER.info("Phase B links done for table %s (patched=%s)", airtable_table_id, patched)
@@ -1160,14 +1182,22 @@ class Migrator:
                             linked_target,
                         )
                         continue
-                    self.create_field_if_needed(
-                        table["id"],
-                        baserow_table_id,
-                        field,
-                        baserow_field_name,
-                        baserow_type,
-                        extra,
-                    )
+                    try:
+                        self.create_field_if_needed(
+                            table["id"],
+                            baserow_table_id,
+                            field,
+                            baserow_field_name,
+                            baserow_type,
+                            extra,
+                        )
+                    except Exception as exc:
+                        self.report["totals"]["fields_failed"] += 1
+                        self._add_error(
+                            "create_field",
+                            str(exc),
+                            {"table_id": table["id"], "field_name": field.get("name"), "field_type": baserow_type},
+                        )
 
         # Second pass for relation fields.
         # Track created links as (baserow_source, baserow_target) so we can
@@ -1175,85 +1205,91 @@ class Migrator:
         created_link_pairs: set[tuple[int, int]] = set()
 
         for airtable_table_id, baserow_table_id, field, baserow_field_name, linked_target in deferred_links:
-            target_baserow_table_id = self.mapping.get_table(linked_target)
-            if not target_baserow_table_id:
-                LOGGER.warning(
-                    "Skipping relation field %s on table %s; target table %s not created",
-                    field.get("name"),
-                    airtable_table_id,
-                    linked_target,
-                )
-                self._add_error(
-                    "create_link_field",
-                    "Target table missing for relation field",
-                    {
-                        "airtable_table_id": airtable_table_id,
-                        "linked_target_airtable_table_id": linked_target,
-                        "field_name": field.get("name"),
-                    },
-                )
-                continue
-
-            reverse_pair = (target_baserow_table_id, baserow_table_id)
-            if reverse_pair in created_link_pairs:
-                # The forward link already created a reverse field on this table.
-                # Find the auto-created reverse field via the Baserow API.
-                reverse_field_id = self._find_reverse_link_field(
-                    baserow_table_id, target_baserow_table_id, baserow_field_name
-                )
-                self.mapping.set_field(
-                    airtable_table_id,
-                    field["id"],
-                    field.get("name", field["id"]),
-                    reverse_field_id,
-                    baserow_field_name,
-                    "link_row",
-                    linked_target,
-                )
-                if reverse_field_id:
-                    LOGGER.info(
-                        "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
-                        baserow_field_name, reverse_field_id, baserow_table_id,
+            try:
+                target_baserow_table_id = self.mapping.get_table(linked_target)
+                if not target_baserow_table_id:
+                    LOGGER.warning(
+                        "Skipping relation field %s on table %s; target table %s not created",
+                        field.get("name"),
+                        airtable_table_id,
+                        linked_target,
                     )
-                continue
+                    self._add_error(
+                        "create_link_field",
+                        "Target table missing for relation field",
+                        {
+                            "airtable_table_id": airtable_table_id,
+                            "linked_target_airtable_table_id": linked_target,
+                            "field_name": field.get("name"),
+                        },
+                    )
+                    continue
 
-            source_base_id = self.mapping.get_base_id_for_table(airtable_table_id)
-            target_base_id = self.mapping.get_base_id_for_table(linked_target)
-            source_db = self.mapping.get_base(source_base_id) if source_base_id else None
-            target_db = self.mapping.get_base(target_base_id) if target_base_id else None
-            if source_db and target_db and source_db != target_db:
-                LOGGER.warning(
-                    "Skipping cross-database link field '%s' on table %s: "
-                    "source db %s != target db %s (Baserow requires same database)",
-                    field.get("name"), airtable_table_id, source_db, target_db,
+                reverse_pair = (target_baserow_table_id, baserow_table_id)
+                if reverse_pair in created_link_pairs:
+                    reverse_field_id = self._find_reverse_link_field(
+                        baserow_table_id, target_baserow_table_id, baserow_field_name
+                    )
+                    self.mapping.set_field(
+                        airtable_table_id,
+                        field["id"],
+                        field.get("name", field["id"]),
+                        reverse_field_id,
+                        baserow_field_name,
+                        "link_row",
+                        linked_target,
+                    )
+                    if reverse_field_id:
+                        LOGGER.info(
+                            "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
+                            baserow_field_name, reverse_field_id, baserow_table_id,
+                        )
+                    continue
+
+                source_base_id = self.mapping.get_base_id_for_table(airtable_table_id)
+                target_base_id = self.mapping.get_base_id_for_table(linked_target)
+                source_db = self.mapping.get_base(source_base_id) if source_base_id else None
+                target_db = self.mapping.get_base(target_base_id) if target_base_id else None
+                if source_db and target_db and source_db != target_db:
+                    LOGGER.warning(
+                        "Skipping cross-database link field '%s' on table %s: "
+                        "source db %s != target db %s (Baserow requires same database)",
+                        field.get("name"), airtable_table_id, source_db, target_db,
+                    )
+                    self._add_error(
+                        "create_link_field",
+                        "Cross-database link not supported in Baserow",
+                        {
+                            "airtable_table_id": airtable_table_id,
+                            "linked_target_airtable_table_id": linked_target,
+                            "field_name": field.get("name"),
+                            "source_baserow_db": source_db,
+                            "target_baserow_db": target_db,
+                        },
+                    )
+                    self.mapping.set_field(
+                        airtable_table_id, field["id"],
+                        field.get("name", field["id"]),
+                        None, baserow_field_name, "link_row", linked_target,
+                    )
+                    continue
+
+                self.create_link_field_if_needed(
+                    airtable_table_id,
+                    baserow_table_id,
+                    field,
+                    baserow_field_name,
+                    target_baserow_table_id,
+                    linked_target,
                 )
+                created_link_pairs.add((baserow_table_id, target_baserow_table_id))
+            except Exception as exc:
+                self.report["totals"]["fields_failed"] += 1
                 self._add_error(
                     "create_link_field",
-                    "Cross-database link not supported in Baserow",
-                    {
-                        "airtable_table_id": airtable_table_id,
-                        "linked_target_airtable_table_id": linked_target,
-                        "field_name": field.get("name"),
-                        "source_baserow_db": source_db,
-                        "target_baserow_db": target_db,
-                    },
+                    str(exc),
+                    {"table_id": airtable_table_id, "field_name": field.get("name"), "linked_target": linked_target},
                 )
-                self.mapping.set_field(
-                    airtable_table_id, field["id"],
-                    field.get("name", field["id"]),
-                    None, baserow_field_name, "link_row", linked_target,
-                )
-                continue
-
-            self.create_link_field_if_needed(
-                airtable_table_id,
-                baserow_table_id,
-                field,
-                baserow_field_name,
-                target_baserow_table_id,
-                linked_target,
-            )
-            created_link_pairs.add((baserow_table_id, target_baserow_table_id))
 
         return plan
 
@@ -1262,15 +1298,39 @@ class Migrator:
             base_id = base["id"]
             LOGGER.info("Migrating rows for base %s (%s)", base.get("name", base_id), base_id)
             for table in tables:
-                self.migrate_rows_phase_a(base_id, table)
+                try:
+                    self.migrate_rows_phase_a(base_id, table)
+                except Exception as exc:
+                    self._add_error(
+                        "migrate_rows_phase_a",
+                        str(exc)[:300],
+                        {"base_id": base_id, "table_id": table.get("id")},
+                    )
             for table in tables:
-                self.migrate_links_phase_b(base_id, table)
+                try:
+                    self.migrate_links_phase_b(base_id, table)
+                except Exception as exc:
+                    self._add_error(
+                        "migrate_links_phase_b",
+                        str(exc)[:300],
+                        {"base_id": base_id, "table_id": table.get("id")},
+                    )
 
     def run(self) -> None:
         try:
             plan = self.create_schema()
             self.migrate_data(plan)
-            LOGGER.info("Migration completed successfully.")
+            totals = self.report["totals"]
+            error_count = len(self.report["errors"])
+            if error_count:
+                LOGGER.warning(
+                    "Migration completed with %s error(s). "
+                    "rows_failed=%s, fields_failed=%s, link_patches_failed=%s. "
+                    "See migration report for details.",
+                    error_count, totals["rows_failed"], totals["fields_failed"], totals["link_patches_failed"],
+                )
+            else:
+                LOGGER.info("Migration completed successfully with zero errors.")
         finally:
             self._write_report()
 
