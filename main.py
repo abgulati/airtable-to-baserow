@@ -785,6 +785,41 @@ class Migrator:
         )
         return None
 
+    def _ensure_select_options(self, baserow_table_id: int, row_payload: Dict[str, Any]) -> None:
+        """Check row payload for select values and add any missing options to Baserow fields."""
+        actual_fields = self.get_baserow_fields(baserow_table_id)
+        fields_by_name = {f["name"]: f for f in actual_fields}
+        for field_name, value in row_payload.items():
+            field = fields_by_name.get(field_name)
+            if not field:
+                continue
+            ftype = field.get("type", "")
+            if ftype not in ("single_select", "multiple_select"):
+                continue
+            existing_options = {opt["value"] for opt in field.get("select_options", [])}
+            values_to_check = [value] if ftype == "single_select" else (value or [])
+            missing = [v for v in values_to_check if v and v not in existing_options]
+            if not missing:
+                continue
+            new_options = list(field.get("select_options", []))
+            color_idx = len(new_options)
+            for val in missing:
+                new_options.append({
+                    "value": val,
+                    "color": BASEROW_SELECT_COLORS[color_idx % len(BASEROW_SELECT_COLORS)],
+                })
+                color_idx += 1
+            self.baserow_management_request(
+                "PATCH",
+                f"/api/database/fields/{field['id']}/",
+                {200},
+                {"select_options": new_options},
+            )
+            LOGGER.info(
+                "Added missing select options %s to field '%s' in table %s",
+                missing, field_name, baserow_table_id,
+            )
+
     def iter_airtable_records(self, base_id: str, table_id: str) -> Iterable[Dict[str, Any]]:
         offset = None
         while True:
@@ -920,12 +955,25 @@ class Migrator:
                 LOGGER.info("[dry-run] Would create row in table %s with fields: %s", baserow_table_id, list(row_payload))
                 continue
 
-            row = self.baserow_row_request(
-                "POST",
-                f"/api/database/rows/table/{baserow_table_id}/?user_field_names=true",
-                {200, 201},
-                row_payload,
-            )
+            try:
+                row = self.baserow_row_request(
+                    "POST",
+                    f"/api/database/rows/table/{baserow_table_id}/?user_field_names=true",
+                    {200, 201},
+                    row_payload,
+                )
+            except RuntimeError as exc:
+                if "not a valid select option" in str(exc).lower():
+                    LOGGER.info("Missing select option detected, adding options and retrying row")
+                    self._ensure_select_options(baserow_table_id, row_payload)
+                    row = self.baserow_row_request(
+                        "POST",
+                        f"/api/database/rows/table/{baserow_table_id}/?user_field_names=true",
+                        {200, 201},
+                        row_payload,
+                    )
+                else:
+                    raise
             self.mapping.set_record(airtable_table_id, airtable_record_id, int(row["id"]))
             created += 1
             if created % self.config.batch_size == 0:
