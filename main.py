@@ -31,6 +31,19 @@ def _to_bool(raw: str) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _normalize_link_row_table_id(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
+
+
 def _sanitize_name(name: str, fallback: str) -> str:
     cleaned = re.sub(r"\s+", " ", (name or "").strip())
     cleaned = re.sub(r"[^\w \-.:/]", "_", cleaned)
@@ -114,6 +127,13 @@ class Config:
             airtable_base_ids=base_ids,
             report_path=Path(os.getenv("REPORT_PATH", "migration_report.json")),
         )
+
+
+@dataclass(frozen=True)
+class LinkFieldResult:
+    field_id: int
+    created_new_field: bool
+    reverse_field_id: Optional[int] = None
 
 
 class MappingStore:
@@ -572,7 +592,14 @@ class Migrator:
             return "file", {}, False
         if ftype == "multipleRecordLinks":
             linked_table_id = options.get("linkedTableId")
-            return "link_row", {"linked_target_airtable_table_id": linked_table_id}, True
+            return (
+                "link_row",
+                {
+                    "linked_target_airtable_table_id": linked_table_id,
+                    "inverse_link_airtable_field_id": options.get("inverseLinkFieldId"),
+                },
+                True,
+            )
         # Formulas/lookups/rollups and unsupported types fallback to text.
         return "long_text", {}, False
 
@@ -738,15 +765,8 @@ class Migrator:
         baserow_field_name: str,
         target_baserow_table_id: int,
         linked_target_airtable_table_id: str,
-    ) -> Optional[int]:
+    ) -> Optional[LinkFieldResult]:
         known = {f["airtable_field_id"]: f for f in self.mapping.get_fields_for_table(airtable_table_id)}
-        if (
-            airtable_field["id"] in known
-            and known[airtable_field["id"]]["baserow_field_type"] == "link_row"
-            and known[airtable_field["id"]]["baserow_field_id"] is not None
-        ):
-            return known[airtable_field["id"]]["baserow_field_id"]
-
         if self.config.dry_run:
             LOGGER.info(
                 "[dry-run] Would create link field '%s' in table %s -> table %s",
@@ -764,28 +784,151 @@ class Migrator:
                 "link_row",
                 linked_target_airtable_table_id,
             )
-            return fake_id
+            reverse_field_id = self._next_fake_id() if baserow_table_id != target_baserow_table_id else None
+            return LinkFieldResult(fake_id, True, reverse_field_id)
 
         existing_fields = self.get_baserow_fields(baserow_table_id)
+        existing_fields_by_id = {int(f["id"]): f for f in existing_fields}
+        known_field = known.get(airtable_field["id"])
+        if (
+            known_field
+            and known_field["baserow_field_type"] == "link_row"
+            and known_field["baserow_field_id"] is not None
+        ):
+            field_id = known_field["baserow_field_id"]
+            actual_field = existing_fields_by_id.get(field_id)
+            actual_name = actual_field.get("name") if actual_field else None
+            actual_type = actual_field.get("type") if actual_field else None
+            actual_target_table_id = _normalize_link_row_table_id(
+                actual_field.get("link_row_table_id") if actual_field else None
+            )
+            if (
+                actual_field
+                and actual_name == baserow_field_name
+                and actual_type == "link_row"
+                and actual_target_table_id == target_baserow_table_id
+            ):
+                reverse_field_id = None
+                if baserow_table_id != target_baserow_table_id:
+                    reverse_field_id = self._find_reverse_link_field(
+                        target_baserow_table_id,
+                        baserow_table_id,
+                    )
+                return LinkFieldResult(field_id, False, reverse_field_id)
+
+            LOGGER.warning(
+                "Stored link mapping for Airtable field '%s' on table %s is stale or mismatched; mapped Baserow field "
+                "id=%s resolved to name=%s type=%s target=%s. Revalidating against live schema.",
+                airtable_field.get("name", airtable_field["id"]),
+                baserow_table_id,
+                field_id,
+                actual_name,
+                actual_type,
+                actual_target_table_id,
+            )
+            self._add_error(
+                "create_link_field",
+                "Stored Baserow link field mapping rejected after live schema verification",
+                {
+                    "airtable_table_id": airtable_table_id,
+                    "airtable_field_id": airtable_field["id"],
+                    "field_name": airtable_field.get("name", airtable_field["id"]),
+                    "baserow_table_id": baserow_table_id,
+                    "baserow_field_id": field_id,
+                    "expected_baserow_field_name": baserow_field_name,
+                    "actual_baserow_field_name": actual_name,
+                    "expected_baserow_field_type": "link_row",
+                    "actual_baserow_field_type": actual_type,
+                    "expected_target_baserow_table_id": target_baserow_table_id,
+                    "actual_target_baserow_table_id": actual_target_table_id,
+                    "linked_target_airtable_table_id": linked_target_airtable_table_id,
+                },
+            )
+            self.mapping.set_field(
+                airtable_table_id,
+                airtable_field["id"],
+                airtable_field.get("name", airtable_field["id"]),
+                None,
+                baserow_field_name,
+                "link_row",
+                linked_target_airtable_table_id,
+            )
+
         for ef in existing_fields:
             if ef.get("name") == baserow_field_name:
                 field_id = int(ef["id"])
-                LOGGER.info(
-                    "Field '%s' already exists in Baserow table %s (id=%s, type=%s), adopting as link field",
-                    baserow_field_name, baserow_table_id, field_id, ef.get("type"),
+                actual_type = ef.get("type")
+                actual_target_table_id = _normalize_link_row_table_id(ef.get("link_row_table_id"))
+                if actual_type == "link_row" and actual_target_table_id == target_baserow_table_id:
+                    LOGGER.info(
+                        "Field '%s' already exists in Baserow table %s (id=%s, type=%s), adopting as link field",
+                        baserow_field_name, baserow_table_id, field_id, actual_type,
+                    )
+                    self.mapping.set_field(
+                        airtable_table_id,
+                        airtable_field["id"],
+                        airtable_field.get("name", airtable_field["id"]),
+                        field_id,
+                        baserow_field_name,
+                        "link_row",
+                        linked_target_airtable_table_id,
+                    )
+                    reverse_field_id = None
+                    if baserow_table_id != target_baserow_table_id:
+                        reverse_field_id = self._find_reverse_link_field(
+                            target_baserow_table_id,
+                            baserow_table_id,
+                        )
+                    return LinkFieldResult(field_id, False, reverse_field_id)
+
+                LOGGER.warning(
+                    "Field '%s' already exists in Baserow table %s (id=%s) but does not match the expected link field "
+                    "shape; expected type=link_row target=%s, actual type=%s target=%s. Skipping relation field.",
+                    baserow_field_name,
+                    baserow_table_id,
+                    field_id,
+                    target_baserow_table_id,
+                    actual_type,
+                    actual_target_table_id,
                 )
+                self.report["totals"]["fields_failed"] += 1
                 self.mapping.set_field(
                     airtable_table_id,
                     airtable_field["id"],
                     airtable_field.get("name", airtable_field["id"]),
-                    field_id,
+                    None,
                     baserow_field_name,
                     "link_row",
                     linked_target_airtable_table_id,
                 )
-                return field_id
+                self._add_error(
+                    "create_link_field",
+                    "Existing Baserow field mismatch for relation field",
+                    {
+                        "airtable_table_id": airtable_table_id,
+                        "airtable_field_id": airtable_field["id"],
+                        "field_name": airtable_field.get("name", airtable_field["id"]),
+                        "baserow_table_id": baserow_table_id,
+                        "baserow_field_id": field_id,
+                        "baserow_field_name": baserow_field_name,
+                        "expected_baserow_field_type": "link_row",
+                        "actual_baserow_field_type": actual_type,
+                        "expected_target_baserow_table_id": target_baserow_table_id,
+                        "actual_target_baserow_table_id": actual_target_table_id,
+                        "linked_target_airtable_table_id": linked_target_airtable_table_id,
+                    },
+                )
+                return None
 
         is_self_ref = baserow_table_id == target_baserow_table_id
+        reverse_field_ids_before: set[int] = set()
+        if not is_self_ref:
+            reverse_field_ids_before = {
+                int(f["id"])
+                for f in self.get_baserow_fields(target_baserow_table_id)
+                if f.get("type") == "link_row"
+                and _normalize_link_row_table_id(f.get("link_row_table_id")) == baserow_table_id
+            }
         payload = self.baserow_management_request(
             "POST",
             f"/api/database/fields/table/{baserow_table_id}/",
@@ -798,6 +941,13 @@ class Migrator:
             },
         )
         field_id = int(payload["id"])
+        reverse_field_id = None
+        if not is_self_ref:
+            reverse_field_id = self._find_reverse_link_field(
+                target_baserow_table_id,
+                baserow_table_id,
+                reverse_field_ids_before,
+            )
         self.mapping.set_field(
             airtable_table_id,
             airtable_field["id"],
@@ -811,18 +961,36 @@ class Migrator:
         table_report = self._table_report(base_id, airtable_table_id)
         table_report["link_fields_created"] += 1
         LOGGER.info("Created link-row field '%s' in table %s", baserow_field_name, baserow_table_id)
-        return field_id
+        return LinkFieldResult(field_id, True, reverse_field_id)
 
     def _find_reverse_link_field(
-        self, baserow_table_id: int, target_baserow_table_id: int, preferred_name: str
+        self, baserow_table_id: int, target_baserow_table_id: int, existing_field_ids: Optional[set[int]] = None
     ) -> Optional[int]:
-        """Find the auto-created reverse link_row field on baserow_table_id that points to target_baserow_table_id."""
+        """Find the unique reverse link_row field on baserow_table_id that points to target_baserow_table_id."""
         if self.config.dry_run:
             return self._next_fake_id()
         fields = self.get_baserow_fields(baserow_table_id)
+        candidate_ids: List[int] = []
         for f in fields:
-            if f.get("type") == "link_row" and f.get("link_row_table_id") == target_baserow_table_id:
-                return int(f["id"])
+            if (
+                f.get("type") != "link_row"
+                or _normalize_link_row_table_id(f.get("link_row_table_id")) != target_baserow_table_id
+            ):
+                continue
+            field_id = int(f["id"])
+            if existing_field_ids and field_id in existing_field_ids:
+                continue
+            candidate_ids.append(field_id)
+        if len(candidate_ids) == 1:
+            return candidate_ids[0]
+        if candidate_ids:
+            LOGGER.warning(
+                "Could not uniquely identify auto-created reverse link field on table %s pointing to %s; candidates=%s",
+                baserow_table_id,
+                target_baserow_table_id,
+                candidate_ids,
+            )
+            return None
         LOGGER.warning(
             "Could not find auto-created reverse link field on table %s pointing to %s",
             baserow_table_id, target_baserow_table_id,
@@ -1070,13 +1238,45 @@ class Migrator:
         actual_link_field_names: Dict[int, str] = {}
         if not self.config.dry_run:
             actual_fields = self.get_baserow_fields(baserow_table_id)
-            actual_link_field_names = {
-                int(f["id"]): f["name"] for f in actual_fields if f.get("type") == "link_row"
-            }
-            link_fields = [
-                item for item in link_fields
-                if item["baserow_field_id"] in actual_link_field_names
-            ]
+            actual_fields_by_id = {int(f["id"]): f for f in actual_fields}
+            valid_link_fields = []
+            for item in link_fields:
+                mapped_field_id = item["baserow_field_id"]
+                actual_field = actual_fields_by_id.get(mapped_field_id)
+                expected_target_baserow_table_id = None
+                target_airtable_table_id = item["linked_target_airtable_table_id"]
+                if target_airtable_table_id:
+                    expected_target_baserow_table_id = self.mapping.get_table(target_airtable_table_id)
+                actual_target_baserow_table_id = _normalize_link_row_table_id(
+                    actual_field.get("link_row_table_id") if actual_field else None
+                )
+                if (
+                    actual_field
+                    and actual_field.get("type") == "link_row"
+                    and actual_target_baserow_table_id == expected_target_baserow_table_id
+                ):
+                    actual_link_field_names[mapped_field_id] = actual_field["name"]
+                    valid_link_fields.append(item)
+                    continue
+
+                self._add_error(
+                    "patch_links",
+                    "Mapped Baserow link field missing or mismatched",
+                    {
+                        "airtable_table_id": airtable_table_id,
+                        "airtable_field_id": item["airtable_field_id"],
+                        "field_name": item["airtable_field_name"],
+                        "baserow_table_id": baserow_table_id,
+                        "baserow_field_id": mapped_field_id,
+                        "mapped_baserow_field_name": item["baserow_field_name"],
+                        "linked_target_airtable_table_id": target_airtable_table_id,
+                        "expected_target_baserow_table_id": expected_target_baserow_table_id,
+                        "actual_baserow_field_name": actual_field.get("name") if actual_field else None,
+                        "actual_baserow_field_type": actual_field.get("type") if actual_field else None,
+                        "actual_target_baserow_table_id": actual_target_baserow_table_id,
+                    },
+                )
+            link_fields = valid_link_fields
         if not link_fields:
             return
 
@@ -1144,7 +1344,7 @@ class Migrator:
             return []
 
         plan: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]] = []
-        deferred_links: List[Tuple[str, int, Dict[str, Any], str, str]] = []
+        deferred_links: List[Tuple[str, int, Dict[str, Any], str, str, Optional[str]]] = []
 
         for base in discovered:
             base_id = base["id"]
@@ -1197,12 +1397,23 @@ class Migrator:
                         linked_target = extra.get("linked_target_airtable_table_id")
                         if not linked_target:
                             LOGGER.warning("Skipping link field %s: missing linked table metadata", field.get("name"))
+                            self.report["totals"]["fields_failed"] += 1
                             table_report = self._table_report(
                                 base_id,
                                 table["id"],
                                 table.get("name", table["id"]),
                             )
                             table_report["errors"].append("Missing linked table metadata for a link field.")
+                            self._add_error(
+                                "create_link_field",
+                                "Missing linked table metadata for relation field",
+                                {
+                                    "airtable_base_id": base_id,
+                                    "airtable_table_id": table["id"],
+                                    "airtable_field_id": field["id"],
+                                    "field_name": field.get("name", field["id"]),
+                                },
+                            )
                             continue
                         deferred_links.append(
                             (
@@ -1211,6 +1422,7 @@ class Migrator:
                                 field,
                                 baserow_field_name,
                                 linked_target,
+                                extra.get("inverse_link_airtable_field_id"),
                             )
                         )
                         self.mapping.set_field(
@@ -1241,14 +1453,23 @@ class Migrator:
                         )
 
         # Second pass for relation fields.
-        # Track created links as (baserow_source, baserow_target) so we can
-        # detect reverse links that Baserow auto-creates.
-        created_link_pairs: set[tuple[int, int]] = set()
+        # Track exact reverse-link claims so multiple distinct relations
+        # between the same two tables do not collapse onto one reverse field.
+        pending_reverse_link_claims: Dict[str, Optional[int]] = {}
+        pending_pair_reverse_claims: Dict[tuple[int, int], List[Optional[int]]] = {}
 
-        for airtable_table_id, baserow_table_id, field, baserow_field_name, linked_target in deferred_links:
+        for (
+            airtable_table_id,
+            baserow_table_id,
+            field,
+            baserow_field_name,
+            linked_target,
+            inverse_link_airtable_field_id,
+        ) in deferred_links:
             try:
                 target_baserow_table_id = self.mapping.get_table(linked_target)
                 if not target_baserow_table_id:
+                    self.report["totals"]["fields_failed"] += 1
                     LOGGER.warning(
                         "Skipping relation field %s on table %s; target table %s not created",
                         field.get("name"),
@@ -1266,32 +1487,89 @@ class Migrator:
                     )
                     continue
 
-                reverse_pair = (target_baserow_table_id, baserow_table_id)
-                if reverse_pair in created_link_pairs:
-                    reverse_field_id = self._find_reverse_link_field(
-                        baserow_table_id, target_baserow_table_id, baserow_field_name
-                    )
-                    self.mapping.set_field(
-                        airtable_table_id,
-                        field["id"],
-                        field.get("name", field["id"]),
-                        reverse_field_id,
-                        baserow_field_name,
-                        "link_row",
-                        linked_target,
-                    )
-                    if reverse_field_id:
+                if field["id"] in pending_reverse_link_claims:
+                    reverse_field_id = pending_reverse_link_claims.pop(field["id"])
+                    if reverse_field_id is None:
+                        LOGGER.warning(
+                            "Discarding unresolved reverse link claim for field '%s' on table %s; falling back to live schema verification.",
+                            field.get("name", field["id"]),
+                            baserow_table_id,
+                        )
+                    else:
+                        self.mapping.set_field(
+                            airtable_table_id,
+                            field["id"],
+                            field.get("name", field["id"]),
+                            reverse_field_id,
+                            baserow_field_name,
+                            "link_row",
+                            linked_target,
+                        )
                         LOGGER.info(
                             "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
                             baserow_field_name, reverse_field_id, baserow_table_id,
                         )
-                    continue
+                        continue
+
+                reverse_pair = (baserow_table_id, target_baserow_table_id)
+                pair_claims = pending_pair_reverse_claims.get(reverse_pair, [])
+                if not inverse_link_airtable_field_id and pair_claims:
+                    if len(pair_claims) > 1:
+                        self.report["totals"]["fields_failed"] += 1
+                        self.mapping.set_field(
+                            airtable_table_id,
+                            field["id"],
+                            field.get("name", field["id"]),
+                            None,
+                            baserow_field_name,
+                            "link_row",
+                            linked_target,
+                        )
+                        self._add_error(
+                            "create_link_field",
+                            "Ambiguous reverse link field resolution",
+                            {
+                                "airtable_table_id": airtable_table_id,
+                                "airtable_field_id": field["id"],
+                                "field_name": field.get("name", field["id"]),
+                                "baserow_table_id": baserow_table_id,
+                                "target_baserow_table_id": target_baserow_table_id,
+                                "pending_reverse_field_ids": pair_claims[:],
+                            },
+                        )
+                        continue
+
+                    reverse_field_id = pair_claims.pop(0)
+                    if not pair_claims:
+                        pending_pair_reverse_claims.pop(reverse_pair, None)
+                    if reverse_field_id is None:
+                        LOGGER.warning(
+                            "Discarding unresolved reverse link claim for field '%s' on table %s; falling back to live schema verification.",
+                            field.get("name", field["id"]),
+                            baserow_table_id,
+                        )
+                    else:
+                        self.mapping.set_field(
+                            airtable_table_id,
+                            field["id"],
+                            field.get("name", field["id"]),
+                            reverse_field_id,
+                            baserow_field_name,
+                            "link_row",
+                            linked_target,
+                        )
+                        LOGGER.info(
+                            "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
+                            baserow_field_name, reverse_field_id, baserow_table_id,
+                        )
+                        continue
 
                 source_base_id = self.mapping.get_base_id_for_table(airtable_table_id)
                 target_base_id = self.mapping.get_base_id_for_table(linked_target)
                 source_db = self.mapping.get_base(source_base_id) if source_base_id else None
                 target_db = self.mapping.get_base(target_base_id) if target_base_id else None
                 if source_db and target_db and source_db != target_db:
+                    self.report["totals"]["fields_failed"] += 1
                     LOGGER.warning(
                         "Skipping cross-database link field '%s' on table %s: "
                         "source db %s != target db %s (Baserow requires same database)",
@@ -1315,7 +1593,7 @@ class Migrator:
                     )
                     continue
 
-                self.create_link_field_if_needed(
+                result = self.create_link_field_if_needed(
                     airtable_table_id,
                     baserow_table_id,
                     field,
@@ -1323,7 +1601,28 @@ class Migrator:
                     target_baserow_table_id,
                     linked_target,
                 )
-                created_link_pairs.add((baserow_table_id, target_baserow_table_id))
+                if not result:
+                    continue
+                if baserow_table_id != target_baserow_table_id:
+                    reverse_claim_key = (target_baserow_table_id, baserow_table_id)
+                    if result.reverse_field_id is None:
+                        self.report["totals"]["fields_failed"] += 1
+                        self._add_error(
+                            "create_link_field",
+                            "Could not uniquely resolve auto-created reverse link field",
+                            {
+                                "airtable_table_id": airtable_table_id,
+                                "airtable_field_id": field["id"],
+                                "field_name": field.get("name", field["id"]),
+                                "baserow_table_id": baserow_table_id,
+                                "target_baserow_table_id": target_baserow_table_id,
+                                "inverse_link_airtable_field_id": inverse_link_airtable_field_id,
+                            },
+                        )
+                    elif inverse_link_airtable_field_id:
+                        pending_reverse_link_claims[inverse_link_airtable_field_id] = result.reverse_field_id
+                    else:
+                        pending_pair_reverse_claims.setdefault(reverse_claim_key, []).append(result.reverse_field_id)
             except Exception as exc:
                 self.report["totals"]["fields_failed"] += 1
                 self._add_error(
