@@ -136,6 +136,15 @@ class LinkFieldResult:
     reverse_field_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class PendingReverseLinkClaim:
+    source_airtable_table_id: str
+    source_airtable_field_id: str
+    source_field_name: str
+    source_baserow_table_id: int
+    reverse_field_id: int
+
+
 class MappingStore:
     def __init__(self, db_path: Path, in_memory: bool = False) -> None:
         if in_memory:
@@ -1453,10 +1462,28 @@ class Migrator:
                         )
 
         # Second pass for relation fields.
-        # Track exact reverse-link claims so multiple distinct relations
-        # between the same two tables do not collapse onto one reverse field.
-        pending_reverse_link_claims: Dict[str, Optional[int]] = {}
-        pending_pair_reverse_claims: Dict[tuple[int, int], List[Optional[int]]] = {}
+        # Only adopt auto-created reverse fields when Airtable gives us an
+        # explicit inverse field id to claim against. If inverse metadata is
+        # missing, report the reverse field as unclaimed instead of guessing.
+        pending_reverse_link_claims: Dict[str, PendingReverseLinkClaim] = {}
+        pending_ambiguous_reverse_link_claims: Dict[str, Dict[str, Any]] = {}
+        pending_unclaimed_reverse_fields: Dict[tuple[int, int], List[int]] = {}
+        deferred_link_context_by_field_id = {
+            deferred_field["id"]: {
+                "airtable_table_id": deferred_airtable_table_id,
+                "field_name": deferred_field.get("name", deferred_field["id"]),
+                "baserow_table_id": deferred_baserow_table_id,
+                "linked_target_airtable_table_id": deferred_linked_target,
+            }
+            for (
+                deferred_airtable_table_id,
+                deferred_baserow_table_id,
+                deferred_field,
+                _deferred_baserow_field_name,
+                deferred_linked_target,
+                _deferred_inverse_link_airtable_field_id,
+            ) in deferred_links
+        }
 
         for (
             airtable_table_id,
@@ -1487,34 +1514,52 @@ class Migrator:
                     )
                     continue
 
-                if field["id"] in pending_reverse_link_claims:
-                    reverse_field_id = pending_reverse_link_claims.pop(field["id"])
-                    if reverse_field_id is None:
-                        LOGGER.warning(
-                            "Discarding unresolved reverse link claim for field '%s' on table %s; falling back to live schema verification.",
-                            field.get("name", field["id"]),
-                            baserow_table_id,
-                        )
-                    else:
-                        self.mapping.set_field(
-                            airtable_table_id,
-                            field["id"],
-                            field.get("name", field["id"]),
-                            reverse_field_id,
-                            baserow_field_name,
-                            "link_row",
-                            linked_target,
-                        )
-                        LOGGER.info(
-                            "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
-                            baserow_field_name, reverse_field_id, baserow_table_id,
-                        )
-                        continue
+                if field["id"] in pending_ambiguous_reverse_link_claims:
+                    ambiguity = pending_ambiguous_reverse_link_claims.pop(field["id"])
+                    self.mapping.set_field(
+                        airtable_table_id,
+                        field["id"],
+                        field.get("name", field["id"]),
+                        None,
+                        baserow_field_name,
+                        "link_row",
+                        linked_target,
+                    )
+                    self._add_error(
+                        "create_link_field",
+                        "Ambiguous reverse link claim; refusing to adopt auto-created reverse field",
+                        {
+                            "airtable_table_id": airtable_table_id,
+                            "airtable_field_id": field["id"],
+                            "field_name": field.get("name", field["id"]),
+                            "baserow_table_id": baserow_table_id,
+                            "linked_target_airtable_table_id": linked_target,
+                            "ambiguity": ambiguity,
+                        },
+                    )
+                    continue
 
-                reverse_pair = (baserow_table_id, target_baserow_table_id)
-                pair_claims = pending_pair_reverse_claims.get(reverse_pair, [])
-                if not inverse_link_airtable_field_id and pair_claims:
-                    if len(pair_claims) > 1:
+                if field["id"] in pending_reverse_link_claims:
+                    claim = pending_reverse_link_claims.pop(field["id"])
+                    self.mapping.set_field(
+                        airtable_table_id,
+                        field["id"],
+                        field.get("name", field["id"]),
+                        claim.reverse_field_id,
+                        baserow_field_name,
+                        "link_row",
+                        linked_target,
+                    )
+                    LOGGER.info(
+                        "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
+                        baserow_field_name, claim.reverse_field_id, baserow_table_id,
+                    )
+                    continue
+
+                if not inverse_link_airtable_field_id:
+                    reverse_pair = (baserow_table_id, target_baserow_table_id)
+                    unclaimed_reverse_field_ids = pending_unclaimed_reverse_fields.get(reverse_pair, [])
+                    if unclaimed_reverse_field_ids:
                         self.report["totals"]["fields_failed"] += 1
                         self.mapping.set_field(
                             airtable_table_id,
@@ -1527,40 +1572,15 @@ class Migrator:
                         )
                         self._add_error(
                             "create_link_field",
-                            "Ambiguous reverse link field resolution",
+                            "Unclaimed auto-created reverse link field exists; refusing to guess reverse mapping",
                             {
                                 "airtable_table_id": airtable_table_id,
                                 "airtable_field_id": field["id"],
                                 "field_name": field.get("name", field["id"]),
                                 "baserow_table_id": baserow_table_id,
                                 "target_baserow_table_id": target_baserow_table_id,
-                                "pending_reverse_field_ids": pair_claims[:],
+                                "unclaimed_reverse_field_ids": unclaimed_reverse_field_ids[:],
                             },
-                        )
-                        continue
-
-                    reverse_field_id = pair_claims.pop(0)
-                    if not pair_claims:
-                        pending_pair_reverse_claims.pop(reverse_pair, None)
-                    if reverse_field_id is None:
-                        LOGGER.warning(
-                            "Discarding unresolved reverse link claim for field '%s' on table %s; falling back to live schema verification.",
-                            field.get("name", field["id"]),
-                            baserow_table_id,
-                        )
-                    else:
-                        self.mapping.set_field(
-                            airtable_table_id,
-                            field["id"],
-                            field.get("name", field["id"]),
-                            reverse_field_id,
-                            baserow_field_name,
-                            "link_row",
-                            linked_target,
-                        )
-                        LOGGER.info(
-                            "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
-                            baserow_field_name, reverse_field_id, baserow_table_id,
                         )
                         continue
 
@@ -1620,9 +1640,81 @@ class Migrator:
                             },
                         )
                     elif inverse_link_airtable_field_id:
-                        pending_reverse_link_claims[inverse_link_airtable_field_id] = result.reverse_field_id
+                        new_claim = PendingReverseLinkClaim(
+                            source_airtable_table_id=airtable_table_id,
+                            source_airtable_field_id=field["id"],
+                            source_field_name=field.get("name", field["id"]),
+                            source_baserow_table_id=baserow_table_id,
+                            reverse_field_id=result.reverse_field_id,
+                        )
+                        if inverse_link_airtable_field_id in pending_ambiguous_reverse_link_claims:
+                            self.report["totals"]["fields_failed"] += 1
+                            self._add_error(
+                                "create_link_field",
+                                "Additional reverse link claim collided with an already ambiguous inverse field claim",
+                                {
+                                    "airtable_table_id": airtable_table_id,
+                                    "airtable_field_id": field["id"],
+                                    "field_name": field.get("name", field["id"]),
+                                    "baserow_table_id": baserow_table_id,
+                                    "inverse_link_airtable_field_id": inverse_link_airtable_field_id,
+                                    "reverse_field_id": result.reverse_field_id,
+                                    "existing_ambiguity": pending_ambiguous_reverse_link_claims[inverse_link_airtable_field_id],
+                                },
+                            )
+                        else:
+                            existing_claim = pending_reverse_link_claims.get(inverse_link_airtable_field_id)
+                            if existing_claim is None:
+                                pending_reverse_link_claims[inverse_link_airtable_field_id] = new_claim
+                            elif (
+                                existing_claim.source_airtable_field_id == new_claim.source_airtable_field_id
+                                and existing_claim.reverse_field_id == new_claim.reverse_field_id
+                            ):
+                                LOGGER.info(
+                                    "Ignoring duplicate reverse link claim for Airtable field '%s' on inverse field %s",
+                                    new_claim.source_field_name,
+                                    inverse_link_airtable_field_id,
+                                )
+                            else:
+                                pending_reverse_link_claims.pop(inverse_link_airtable_field_id, None)
+                                ambiguity = {
+                                    "inverse_link_airtable_field_id": inverse_link_airtable_field_id,
+                                    "existing_claim": {
+                                        "airtable_table_id": existing_claim.source_airtable_table_id,
+                                        "airtable_field_id": existing_claim.source_airtable_field_id,
+                                        "field_name": existing_claim.source_field_name,
+                                        "baserow_table_id": existing_claim.source_baserow_table_id,
+                                        "reverse_field_id": existing_claim.reverse_field_id,
+                                    },
+                                    "conflicting_claim": {
+                                        "airtable_table_id": new_claim.source_airtable_table_id,
+                                        "airtable_field_id": new_claim.source_airtable_field_id,
+                                        "field_name": new_claim.source_field_name,
+                                        "baserow_table_id": new_claim.source_baserow_table_id,
+                                        "reverse_field_id": new_claim.reverse_field_id,
+                                    },
+                                }
+                                pending_ambiguous_reverse_link_claims[inverse_link_airtable_field_id] = ambiguity
+                                self.report["totals"]["fields_failed"] += 1
+                                self._add_error(
+                                    "create_link_field",
+                                    "Ambiguous reverse link claim detected; refusing to overwrite an existing inverse field claim",
+                                    ambiguity,
+                                )
                     else:
-                        pending_pair_reverse_claims.setdefault(reverse_claim_key, []).append(result.reverse_field_id)
+                        pending_unclaimed_reverse_fields.setdefault(reverse_claim_key, []).append(result.reverse_field_id)
+                        self._add_error(
+                            "create_link_field",
+                            "Auto-created reverse link field left unclaimed because Airtable inverse metadata is missing",
+                            {
+                                "airtable_table_id": airtable_table_id,
+                                "airtable_field_id": field["id"],
+                                "field_name": field.get("name", field["id"]),
+                                "baserow_table_id": baserow_table_id,
+                                "target_baserow_table_id": target_baserow_table_id,
+                                "reverse_field_id": result.reverse_field_id,
+                            },
+                        )
             except Exception as exc:
                 self.report["totals"]["fields_failed"] += 1
                 self._add_error(
@@ -1630,6 +1722,41 @@ class Migrator:
                     str(exc),
                     {"table_id": airtable_table_id, "field_name": field.get("name"), "linked_target": linked_target},
                 )
+
+        for claimed_airtable_field_id, claim in pending_reverse_link_claims.items():
+            self.report["totals"]["fields_failed"] += 1
+            claim_context = deferred_link_context_by_field_id.get(claimed_airtable_field_id, {})
+            self._add_error(
+                "create_link_field",
+                "Unconsumed reverse link claim",
+                {
+                    "airtable_field_id": claimed_airtable_field_id,
+                    "field_name": claim_context.get("field_name"),
+                    "airtable_table_id": claim_context.get("airtable_table_id"),
+                    "baserow_table_id": claim_context.get("baserow_table_id"),
+                    "linked_target_airtable_table_id": claim_context.get("linked_target_airtable_table_id"),
+                    "reverse_field_id": claim.reverse_field_id,
+                    "claim_origin_airtable_table_id": claim.source_airtable_table_id,
+                    "claim_origin_airtable_field_id": claim.source_airtable_field_id,
+                    "claim_origin_field_name": claim.source_field_name,
+                    "claim_origin_baserow_table_id": claim.source_baserow_table_id,
+                },
+            )
+
+        for claimed_airtable_field_id, ambiguity in pending_ambiguous_reverse_link_claims.items():
+            claim_context = deferred_link_context_by_field_id.get(claimed_airtable_field_id, {})
+            self._add_error(
+                "create_link_field",
+                "Unconsumed ambiguous reverse link claim",
+                {
+                    "airtable_field_id": claimed_airtable_field_id,
+                    "field_name": claim_context.get("field_name"),
+                    "airtable_table_id": claim_context.get("airtable_table_id"),
+                    "baserow_table_id": claim_context.get("baserow_table_id"),
+                    "linked_target_airtable_table_id": claim_context.get("linked_target_airtable_table_id"),
+                    "ambiguity": ambiguity,
+                },
+            )
 
         return plan
 
