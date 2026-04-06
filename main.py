@@ -426,6 +426,7 @@ class Migrator:
                 "attachments_reused_from_cache": 0,
                 "files_uploaded_to_baserow": 0,
                 "files_failed": 0,
+                "rows_failed": 0,
                 "errors": [],
             }
         self.table_names[table_id] = resolved_table_name
@@ -887,6 +888,7 @@ class Migrator:
                 linked_target_airtable_table_id,
                 None,
             )
+            known_field = None
 
         for ef in existing_fields:
             if ef.get("name") == baserow_field_name:
@@ -1289,7 +1291,6 @@ class Migrator:
                     LOGGER.info("Table %s: created %s rows", airtable_table_id, created)
             except Exception as exc:
                 self.report["totals"]["rows_failed"] += 1
-                table_report.setdefault("rows_failed", 0)
                 table_report["rows_failed"] += 1
                 self._add_error(
                     "create_row",
