@@ -1222,49 +1222,59 @@ class Migrator:
             return json.dumps(value, ensure_ascii=True)
         return value
 
-    def migrate_rows_phase_a(self, base_id: str, table: Dict[str, Any]) -> None:
-        airtable_table_id = table["id"]
-        table_report = self._table_report(
-            base_id,
-            airtable_table_id,
-            table.get("name", airtable_table_id),
-        )
-        baserow_table_id = self.mapping.get_table(airtable_table_id)
-        if not baserow_table_id:
-            raise RuntimeError(f"Missing Baserow table mapping for Airtable table {airtable_table_id}")
+    def _create_rows_batch(
+        self,
+        baserow_table_id: int,
+        airtable_table_id: str,
+        batch: List[Tuple[str, Dict[str, Any]]],
+        table_report: Dict[str, Any],
+    ) -> int:
+        """Send a batch of rows via the Baserow batch create API.
 
-        fields_meta = self.mapping.get_fields_for_table(airtable_table_id)
-        link_field_names = {
-            item["airtable_field_name"]
-            for item in fields_meta
-            if item["baserow_field_type"] == "link_row"
-        }
-        fields_by_airtable_name = {item["airtable_field_name"]: item for item in fields_meta}
-
-        created = 0
-        skipped = 0
-        for record in self.iter_airtable_records(base_id, airtable_table_id):
-            airtable_record_id = record["id"]
-            if self.mapping.get_record(airtable_table_id, airtable_record_id):
-                skipped += 1
-                continue
-            source_fields = record.get("fields", {})
-            row_payload: Dict[str, Any] = {}
-
-            for source_name, source_value in source_fields.items():
-                if source_name in link_field_names:
-                    continue
-                mapped = fields_by_airtable_name.get(source_name)
-                if not mapped:
-                    continue
-                row_payload[mapped["baserow_field_name"]] = self._transform_value(
-                    mapped["baserow_field_type"], source_value, airtable_record_id, table_report
+        Falls back to individual row creation on any failure.
+        Returns the number of rows successfully created.
+        """
+        if not batch:
+            return 0
+        items = [payload for _, payload in batch]
+        try:
+            result = self.baserow_row_request(
+                "POST",
+                f"/api/database/rows/table/{baserow_table_id}/batch/?user_field_names=true",
+                {200, 201},
+                {"items": items},
+            )
+            created_rows = result.get("items", [])
+            if len(created_rows) != len(batch):
+                raise RuntimeError(
+                    f"Batch create returned {len(created_rows)} items, expected {len(batch)}"
                 )
+            for (airtable_record_id, _), row_data in zip(batch, created_rows):
+                self.mapping.set_record(airtable_table_id, airtable_record_id, int(row_data["id"]))
+            return len(batch)
+        except Exception as batch_exc:
+            LOGGER.warning(
+                "Batch create failed for table %s (%s items), falling back to individual creation: %s",
+                baserow_table_id, len(batch), str(batch_exc)[:200],
+            )
+            return self._create_rows_individually(
+                baserow_table_id, airtable_table_id, batch, table_report
+            )
 
-            if self.config.dry_run:
-                LOGGER.info("[dry-run] Would create row in table %s with fields: %s", baserow_table_id, list(row_payload))
-                continue
+    def _create_rows_individually(
+        self,
+        baserow_table_id: int,
+        airtable_table_id: str,
+        batch: List[Tuple[str, Dict[str, Any]]],
+        table_report: Dict[str, Any],
+    ) -> int:
+        """Create rows one at a time with select-option retry.
 
+        Used as the fallback when batch creation fails.
+        Returns the number of rows successfully created.
+        """
+        created = 0
+        for airtable_record_id, row_payload in batch:
             try:
                 try:
                     row = self.baserow_row_request(
@@ -1287,8 +1297,6 @@ class Migrator:
                         raise
                 self.mapping.set_record(airtable_table_id, airtable_record_id, int(row["id"]))
                 created += 1
-                if created % self.config.batch_size == 0:
-                    LOGGER.info("Table %s: created %s rows", airtable_table_id, created)
             except Exception as exc:
                 self.report["totals"]["rows_failed"] += 1
                 table_report["rows_failed"] += 1
@@ -1297,6 +1305,125 @@ class Migrator:
                     str(exc)[:300],
                     {"airtable_table_id": airtable_table_id, "airtable_record_id": airtable_record_id},
                 )
+        return created
+
+    def _patch_links_batch(
+        self,
+        baserow_table_id: int,
+        airtable_table_id: str,
+        batch: List[Tuple[int, Dict[str, Any]]],
+    ) -> int:
+        """Patch link values via the Baserow batch update API.
+
+        Falls back to individual patches on any failure.
+        Returns the number of rows successfully patched.
+        """
+        if not batch:
+            return 0
+        items = [{"id": row_id, **payload} for row_id, payload in batch]
+        try:
+            self.baserow_row_request(
+                "PATCH",
+                f"/api/database/rows/table/{baserow_table_id}/batch/?user_field_names=true",
+                {200},
+                {"items": items},
+            )
+            return len(batch)
+        except Exception as batch_exc:
+            LOGGER.warning(
+                "Batch link patch failed for table %s (%s items), falling back to individual patches: %s",
+                baserow_table_id, len(batch), str(batch_exc)[:200],
+            )
+            return self._patch_links_individually(
+                baserow_table_id, airtable_table_id, batch
+            )
+
+    def _patch_links_individually(
+        self,
+        baserow_table_id: int,
+        airtable_table_id: str,
+        batch: List[Tuple[int, Dict[str, Any]]],
+    ) -> int:
+        """Patch link values one row at a time.
+
+        Used as the fallback when batch patching fails.
+        Returns the number of rows successfully patched.
+        """
+        patched = 0
+        for baserow_row_id, patch_payload in batch:
+            try:
+                self.baserow_row_request(
+                    "PATCH",
+                    f"/api/database/rows/table/{baserow_table_id}/{baserow_row_id}/?user_field_names=true",
+                    {200},
+                    patch_payload,
+                )
+                patched += 1
+            except Exception as exc:
+                self.report["totals"]["link_patches_failed"] += 1
+                self._add_error(
+                    "patch_links",
+                    str(exc)[:300],
+                    {"airtable_table_id": airtable_table_id, "baserow_row_id": baserow_row_id},
+                )
+        return patched
+
+    def migrate_rows_phase_a(self, base_id: str, table: Dict[str, Any]) -> None:
+        airtable_table_id = table["id"]
+        table_report = self._table_report(
+            base_id,
+            airtable_table_id,
+            table.get("name", airtable_table_id),
+        )
+        baserow_table_id = self.mapping.get_table(airtable_table_id)
+        if not baserow_table_id:
+            raise RuntimeError(f"Missing Baserow table mapping for Airtable table {airtable_table_id}")
+
+        fields_meta = self.mapping.get_fields_for_table(airtable_table_id)
+        link_field_names = {
+            item["airtable_field_name"]
+            for item in fields_meta
+            if item["baserow_field_type"] == "link_row"
+        }
+        fields_by_airtable_name = {item["airtable_field_name"]: item for item in fields_meta}
+
+        created = 0
+        skipped = 0
+        pending_batch: List[Tuple[str, Dict[str, Any]]] = []
+        for record in self.iter_airtable_records(base_id, airtable_table_id):
+            airtable_record_id = record["id"]
+            if self.mapping.get_record(airtable_table_id, airtable_record_id):
+                skipped += 1
+                continue
+            source_fields = record.get("fields", {})
+            row_payload: Dict[str, Any] = {}
+
+            for source_name, source_value in source_fields.items():
+                if source_name in link_field_names:
+                    continue
+                mapped = fields_by_airtable_name.get(source_name)
+                if not mapped:
+                    continue
+                row_payload[mapped["baserow_field_name"]] = self._transform_value(
+                    mapped["baserow_field_type"], source_value, airtable_record_id, table_report
+                )
+
+            if self.config.dry_run:
+                LOGGER.info("[dry-run] Would create row in table %s with fields: %s", baserow_table_id, list(row_payload))
+                continue
+
+            pending_batch.append((airtable_record_id, row_payload))
+            if len(pending_batch) >= self.config.batch_size:
+                created += self._create_rows_batch(
+                    baserow_table_id, airtable_table_id, pending_batch, table_report
+                )
+                pending_batch = []
+                LOGGER.info("Table %s: created %s rows so far", airtable_table_id, created)
+
+        if pending_batch:
+            created += self._create_rows_batch(
+                baserow_table_id, airtable_table_id, pending_batch, table_report
+            )
 
         table_report["rows_created"] += created
         table_report["rows_skipped_existing"] += skipped
@@ -1378,6 +1505,7 @@ class Migrator:
 
         link_fields_by_name = {item["airtable_field_name"]: item for item in link_fields}
         patched = 0
+        pending_batch: List[Tuple[int, Dict[str, Any]]] = []
 
         for record in self.iter_airtable_records(base_id, airtable_table_id):
             baserow_row_id = self.mapping.get_record(airtable_table_id, record["id"])
@@ -1411,23 +1539,18 @@ class Migrator:
                 )
                 continue
 
-            try:
-                self.baserow_row_request(
-                    "PATCH",
-                    f"/api/database/rows/table/{baserow_table_id}/{baserow_row_id}/?user_field_names=true",
-                    {200},
-                    patch_payload,
+            pending_batch.append((baserow_row_id, patch_payload))
+            if len(pending_batch) >= self.config.batch_size:
+                patched += self._patch_links_batch(
+                    baserow_table_id, airtable_table_id, pending_batch
                 )
-                patched += 1
-                if patched % self.config.batch_size == 0:
-                    LOGGER.info("Table %s: patched %s rows with link values", airtable_table_id, patched)
-            except Exception as exc:
-                self.report["totals"]["link_patches_failed"] += 1
-                self._add_error(
-                    "patch_links",
-                    str(exc)[:300],
-                    {"airtable_table_id": airtable_table_id, "baserow_row_id": baserow_row_id},
-                )
+                pending_batch = []
+                LOGGER.info("Table %s: patched %s rows with link values so far", airtable_table_id, patched)
+
+        if pending_batch:
+            patched += self._patch_links_batch(
+                baserow_table_id, airtable_table_id, pending_batch
+            )
         table_report["rows_patched_links"] += patched
         self.report["totals"]["rows_patch_links"] += patched
         LOGGER.info("Phase B links done for table %s (patched=%s)", airtable_table_id, patched)
