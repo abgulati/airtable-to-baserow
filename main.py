@@ -26,6 +26,21 @@ BASEROW_SELECT_COLORS = [
     "blue", "green", "orange", "red", "yellow", "gray",
 ]
 
+BASEROW_VIEW_TYPES = {
+    "grid": "grid",           # Direct mapping
+    "kanban": "kanban",       # Direct mapping
+    "gallery": "gallery",     # Direct mapping
+    "calendar": "calendar",   # Direct mapping
+    "timeline": "timeline",   # Direct mapping (NOT gantt!)
+    "form": "form",           # Direct mapping
+}
+
+UNSUPPORTED_AIRTABLE_VIEW_TYPES = {
+    "map",      # Baserow doesn't support map views
+    "list",     # Baserow doesn't support list views
+    "gantt",    # Baserow doesn't support gantt views
+}
+
 
 def _to_bool(raw: str) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -48,6 +63,10 @@ def _sanitize_name(name: str, fallback: str) -> str:
     cleaned = re.sub(r"\s+", " ", (name or "").strip())
     cleaned = re.sub(r"[^\w \-.:/]", "_", cleaned)
     return cleaned[:255] or fallback
+
+
+def _normalize_view_name(name: str) -> str:
+    return _sanitize_name(name, "View").casefold()
 
 
 def _unique_name(candidate: str, used: set[str]) -> str:
@@ -186,6 +205,18 @@ class MappingStore:
                 airtable_record_id TEXT NOT NULL,
                 baserow_row_id INTEGER NOT NULL,
                 PRIMARY KEY (airtable_table_id, airtable_record_id)
+            );
+            CREATE TABLE IF NOT EXISTS view_map (
+                airtable_table_id TEXT NOT NULL,
+                airtable_view_id TEXT NOT NULL,
+                airtable_view_name TEXT NOT NULL,
+                airtable_view_type TEXT NOT NULL,
+                baserow_view_id INTEGER,
+                baserow_view_name TEXT NOT NULL,
+                baserow_view_type TEXT NOT NULL,
+                is_supported INTEGER NOT NULL DEFAULT 1,
+                skip_reason TEXT,
+                PRIMARY KEY (airtable_table_id, airtable_view_id)
             );
             """
         )
@@ -340,6 +371,66 @@ class MappingStore:
         )
         self.conn.commit()
 
+    def set_view(
+        self,
+        airtable_table_id: str,
+        airtable_view_id: str,
+        airtable_view_name: str,
+        airtable_view_type: str,
+        baserow_view_id: Optional[int],
+        baserow_view_name: str,
+        baserow_view_type: str,
+        is_supported: int,
+        skip_reason: Optional[str],
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO view_map
+            (airtable_table_id, airtable_view_id, airtable_view_name, airtable_view_type,
+            baserow_view_id, baserow_view_name, baserow_view_type, is_supported, skip_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(airtable_table_id, airtable_view_id) DO UPDATE SET
+                airtable_view_name=excluded.airtable_view_name,
+                airtable_view_type=excluded.airtable_view_type,
+                baserow_view_id=excluded.baserow_view_id,
+                baserow_view_name=excluded.baserow_view_name,
+                baserow_view_type=excluded.baserow_view_type,
+                is_supported=excluded.is_supported,
+                skip_reason=excluded.skip_reason
+            """,
+            (
+                airtable_table_id,
+                airtable_view_id,
+                airtable_view_name,
+                airtable_view_type,
+                baserow_view_id,
+                baserow_view_name,
+                baserow_view_type,
+                is_supported,
+                skip_reason,
+            ),
+        )
+        self.conn.commit()
+
+    def get_view(self, airtable_table_id: str, airtable_view_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT baserow_view_id, baserow_view_name, baserow_view_type, is_supported, skip_reason
+            FROM view_map
+            WHERE airtable_table_id = ? AND airtable_view_id = ?
+            """,
+            (airtable_table_id, airtable_view_id),
+        ).fetchone()
+        if row:
+            return {
+                "baserow_view_id": row[0],
+                "baserow_view_name": row[1],
+                "baserow_view_type": row[2],
+                "is_supported": row[3],
+                "skip_reason": row[4],
+            }
+        return None
+
 
 class Migrator:
     def __init__(self, config: Config) -> None:
@@ -378,6 +469,14 @@ class Migrator:
                 "rows_failed": 0,
                 "fields_failed": 0,
                 "link_patches_failed": 0,
+                "views_total": 0,
+                "views_migrated": 0,
+                "views_created": 0,
+                "views_adopted_existing": 0,
+                "views_skipped_existing": 0,
+                "views_failed": 0,
+                "views_unsupported_skipped": 0,
+                "views_total_skipped": 0,
             },
         }
 
@@ -427,6 +526,13 @@ class Migrator:
                 "files_uploaded_to_baserow": 0,
                 "files_failed": 0,
                 "rows_failed": 0,
+                "views_total": 0,
+                "views_migrated": 0,
+                "views_created": 0,
+                "views_adopted_existing": 0,
+                "views_skipped_existing": 0,
+                "views_failed": 0,
+                "views_unsupported_skipped": 0,
                 "errors": [],
             }
         self.table_names[table_id] = resolved_table_name
@@ -434,10 +540,23 @@ class Migrator:
 
     def _write_report(self) -> None:
         self.report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        totals = self.report["totals"]
         output = json.dumps(self.report, indent=2, ensure_ascii=True)
         self.config.report_path.parent.mkdir(parents=True, exist_ok=True)
         self.config.report_path.write_text(output, encoding="utf-8")
         LOGGER.info("Migration report written to %s", self.config.report_path)
+        LOGGER.info(
+            "View Migration Summary: Total=%s, Migrated=%s, Created=%s, Adopted Existing=%s, "
+            "Skipped Existing=%s, Failed=%s, Unsupported Skipped=%s, Total Skipped=%s",
+            totals["views_total"],
+            totals["views_migrated"],
+            totals["views_created"],
+            totals["views_adopted_existing"],
+            totals["views_skipped_existing"],
+            totals["views_failed"],
+            totals["views_unsupported_skipped"],
+            totals["views_total_skipped"],
+        )
 
     def _airtable_headers(self) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self.config.airtable_pat}"}
@@ -574,6 +693,11 @@ class Migrator:
     def get_base_schema(self, base_id: str) -> List[Dict[str, Any]]:
         payload = self.airtable_get(f"/v0/meta/bases/{base_id}/tables")
         return payload.get("tables", [])
+    
+    def get_airtable_views(self, base_id: str, table_id: str) -> List[Dict[str, Any]]:
+        """Fetch all views for an Airtable table."""
+        payload = self.airtable_get(f"/v0/meta/bases/{base_id}/tables/{quote(table_id, safe='')}/views")
+        return payload.get("views", [])
 
     def map_field_definition(self, field: Dict[str, Any]) -> Tuple[str, Dict[str, Any], bool]:
         ftype = field.get("type", "")
@@ -697,6 +821,144 @@ class Migrator:
         if isinstance(payload, list):
             return payload
         return payload.get("results", [])
+
+    def get_baserow_views(self, table_id: int) -> List[Dict[str, Any]]:
+        payload = self.baserow_management_request("GET", f"/api/database/views/table/{table_id}/", {200})
+        if isinstance(payload, list):
+            return payload
+        return payload.get("results", [])
+
+    def map_view_type(self, airtable_view_type: str) -> Tuple[Optional[str], bool]:
+        """Map Airtable view type to Baserow view type.
+
+        Returns:
+            Tuple of (baserow_type, is_supported)
+            is_supported = True means we'll attempt migration
+            is_supported = False means we'll skip and log
+        """
+        normalized = airtable_view_type.lower()
+
+        if normalized in BASEROW_VIEW_TYPES:
+            return BASEROW_VIEW_TYPES[normalized], True
+        if normalized not in UNSUPPORTED_AIRTABLE_VIEW_TYPES:
+            LOGGER.warning("Encountered unknown Airtable view type '%s'; skipping it.", airtable_view_type)
+        return None, False
+
+    def _find_matching_baserow_view(
+        self,
+        baserow_views: List[Dict[str, Any]],
+        view_name: str,
+        view_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_name = _normalize_view_name(view_name)
+        candidates = [
+            view for view in baserow_views
+            if _normalize_view_name(str(view.get("name", ""))) == normalized_name
+            and view.get("type") == view_type
+        ]
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            LOGGER.warning(
+                "Multiple compatible Baserow views named '%s' (%s) were found; adopting id=%s.",
+                view_name,
+                view_type,
+                candidates[0].get("id"),
+            )
+        return candidates[0]
+
+    def ensure_baserow_view(
+        self,
+        airtable_table_id: str,
+        airtable_view_id: str,
+        airtable_view_name: str,
+        airtable_view_type: str,
+        baserow_table_id: int,
+        baserow_view_type: str,
+        baserow_views: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[int, str, List[Dict[str, Any]]]:
+        desired_baserow_view_name = _sanitize_name(airtable_view_name, "View")
+        known_view = self.mapping.get_view(airtable_table_id, airtable_view_id)
+        live_views = baserow_views or []
+
+        if self.config.dry_run:
+            if known_view and known_view.get("baserow_view_id"):
+                return int(known_view["baserow_view_id"]), "skipped_existing", live_views
+            fake_id = self.create_baserow_view(
+                baserow_table_id=baserow_table_id,
+                view_name=airtable_view_name,
+                view_type=baserow_view_type,
+                view_config=None,
+            )
+            return int(fake_id), "created", live_views
+
+        live_views_by_id = {
+            int(view["id"]): view for view in live_views if view.get("id") is not None
+        }
+        if known_view and known_view.get("baserow_view_id") is not None:
+            mapped_view_id = int(known_view["baserow_view_id"])
+            live_view = live_views_by_id.get(mapped_view_id)
+            if live_view and live_view.get("type") == baserow_view_type:
+                self.mapping.set_view(
+                    airtable_table_id=airtable_table_id,
+                    airtable_view_id=airtable_view_id,
+                    airtable_view_name=airtable_view_name,
+                    airtable_view_type=airtable_view_type,
+                    baserow_view_id=mapped_view_id,
+                    baserow_view_name=live_view.get("name", desired_baserow_view_name),
+                    baserow_view_type=live_view.get("type", baserow_view_type),
+                    is_supported=1,
+                    skip_reason=None,
+                )
+                return mapped_view_id, "skipped_existing", live_views
+            LOGGER.warning(
+                "Stored Baserow view mapping for Airtable view '%s' on table %s is stale or mismatched; "
+                "mapped id=%s resolved to type=%s. Revalidating against live views.",
+                airtable_view_name,
+                baserow_table_id,
+                mapped_view_id,
+                live_view.get("type") if live_view else None,
+            )
+
+        adopted_view = self._find_matching_baserow_view(live_views, desired_baserow_view_name, baserow_view_type)
+        if adopted_view:
+            adopted_view_id = int(adopted_view["id"])
+            self.mapping.set_view(
+                airtable_table_id=airtable_table_id,
+                airtable_view_id=airtable_view_id,
+                airtable_view_name=airtable_view_name,
+                airtable_view_type=airtable_view_type,
+                baserow_view_id=adopted_view_id,
+                baserow_view_name=adopted_view.get("name", desired_baserow_view_name),
+                baserow_view_type=adopted_view.get("type", baserow_view_type),
+                is_supported=1,
+                skip_reason=None,
+            )
+            return adopted_view_id, "adopted_existing", live_views
+
+        created_view_id = self.create_baserow_view(
+            baserow_table_id=baserow_table_id,
+            view_name=airtable_view_name,
+            view_type=baserow_view_type,
+            view_config=None,
+        )
+        live_views.append({
+            "id": created_view_id,
+            "name": desired_baserow_view_name,
+            "type": baserow_view_type,
+        })
+        self.mapping.set_view(
+            airtable_table_id=airtable_table_id,
+            airtable_view_id=airtable_view_id,
+            airtable_view_name=airtable_view_name,
+            airtable_view_type=airtable_view_type,
+            baserow_view_id=created_view_id,
+            baserow_view_name=desired_baserow_view_name,
+            baserow_view_type=baserow_view_type,
+            is_supported=1,
+            skip_reason=None,
+        )
+        return int(created_view_id), "created", live_views
 
     def create_field_if_needed(
         self,
@@ -1093,6 +1355,38 @@ class Migrator:
             baserow_table_id, target_baserow_table_id,
         )
         return None
+    
+    def create_baserow_view(
+        self,
+        baserow_table_id: int,
+        view_name: str,
+        view_type: str,
+        view_config: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Create a view in Baserow table."""
+        if self.config.dry_run:
+            fake_id = self._next_fake_id()
+            LOGGER.info("[dry-run] Would create view '%s' (%s) in table %s", view_name, view_type, baserow_table_id)
+            return fake_id
+        
+        body = {
+            "name": _sanitize_name(view_name, "View"),
+            "type": view_type,
+        }
+        
+        # Add configuration if provided (filters, sorts will be skipped per requirements)
+        if view_config:
+            body.update(view_config)
+        
+        payload = self.baserow_management_request(
+            "POST",
+            f"/api/database/views/table/{baserow_table_id}/",
+            {200, 201},
+            body,
+        )
+        view_id = int(payload["id"])
+        LOGGER.info("Created view '%s' in Baserow table %s", view_name, baserow_table_id)
+        return view_id
 
     def _ensure_select_options(self, baserow_table_id: int, row_payload: Dict[str, Any]) -> None:
         """Check row payload for select values and add any missing options to Baserow fields."""
@@ -1367,6 +1661,134 @@ class Migrator:
                     {"airtable_table_id": airtable_table_id, "baserow_row_id": baserow_row_id},
                 )
         return patched
+    
+    def migrate_views_for_table(
+        self,
+        base_id: str,
+        table: Dict[str, Any],
+        baserow_table_id: int,
+    ) -> None:
+        """Migrate all views for a single table."""
+        airtable_table_id = table["id"]
+        table_report = self._table_report(base_id, airtable_table_id)
+        airtable_views = self.get_airtable_views(base_id, airtable_table_id)
+        total_views = len(airtable_views)
+        baserow_views = [] if self.config.dry_run else self.get_baserow_views(baserow_table_id)
+        counts = {
+            "views_migrated": 0,
+            "views_created": 0,
+            "views_adopted_existing": 0,
+            "views_skipped_existing": 0,
+            "views_failed": 0,
+            "views_unsupported_skipped": 0,
+        }
+
+        LOGGER.info(
+            "Processing %s views for table %s",
+            total_views, airtable_table_id,
+        )
+
+        for view in airtable_views:
+            airtable_view_id = view.get("id")
+            airtable_view_name = view.get("name", "Unnamed View")
+            airtable_view_type = view.get("type", "").lower()
+            baserow_type, is_supported = self.map_view_type(airtable_view_type)
+
+            if not is_supported:
+                counts["views_unsupported_skipped"] += 1
+                self.mapping.set_view(
+                    airtable_table_id=airtable_table_id,
+                    airtable_view_id=airtable_view_id,
+                    airtable_view_name=airtable_view_name,
+                    airtable_view_type=airtable_view_type,
+                    baserow_view_id=None,
+                    baserow_view_name=airtable_view_name,
+                    baserow_view_type="unknown",
+                    is_supported=0,
+                    skip_reason=f"Unsupported view type: {airtable_view_type}",
+                )
+                LOGGER.info(
+                    "Skipping unsupported Airtable view '%s' (%s) on table %s",
+                    airtable_view_name,
+                    airtable_view_type,
+                    airtable_table_id,
+                )
+                continue
+
+            try:
+                _baserow_view_id, outcome, baserow_views = self.ensure_baserow_view(
+                    airtable_table_id=airtable_table_id,
+                    airtable_view_id=airtable_view_id,
+                    airtable_view_name=airtable_view_name,
+                    airtable_view_type=airtable_view_type,
+                    baserow_table_id=baserow_table_id,
+                    baserow_view_type=baserow_type,
+                    baserow_views=baserow_views,
+                )
+                counts["views_migrated"] += 1
+                if outcome == "created":
+                    counts["views_created"] += 1
+                elif outcome == "adopted_existing":
+                    counts["views_adopted_existing"] += 1
+                else:
+                    counts["views_skipped_existing"] += 1
+            except Exception as exc:
+                counts["views_failed"] += 1
+                self.mapping.set_view(
+                    airtable_table_id=airtable_table_id,
+                    airtable_view_id=airtable_view_id,
+                    airtable_view_name=airtable_view_name,
+                    airtable_view_type=airtable_view_type,
+                    baserow_view_id=None,
+                    baserow_view_name=airtable_view_name,
+                    baserow_view_type=baserow_type,
+                    is_supported=1,
+                    skip_reason=f"Migration failed: {str(exc)[:100]}",
+                )
+                self._add_error(
+                    "migrate_view",
+                    str(exc),
+                    {
+                        "airtable_base_id": base_id,
+                        "airtable_table_id": airtable_table_id,
+                        "airtable_view_id": airtable_view_id,
+                        "airtable_view_name": airtable_view_name,
+                        "airtable_view_type": airtable_view_type,
+                        "baserow_view_type": baserow_type,
+                    },
+                )
+
+        table_report["views_total"] += total_views
+        table_report["views_migrated"] += counts["views_migrated"]
+        table_report["views_created"] += counts["views_created"]
+        table_report["views_adopted_existing"] += counts["views_adopted_existing"]
+        table_report["views_skipped_existing"] += counts["views_skipped_existing"]
+        table_report["views_failed"] += counts["views_failed"]
+        table_report["views_unsupported_skipped"] += counts["views_unsupported_skipped"]
+
+        self.report["totals"]["views_total"] += total_views
+        self.report["totals"]["views_migrated"] += counts["views_migrated"]
+        self.report["totals"]["views_created"] += counts["views_created"]
+        self.report["totals"]["views_adopted_existing"] += counts["views_adopted_existing"]
+        self.report["totals"]["views_skipped_existing"] += counts["views_skipped_existing"]
+        self.report["totals"]["views_failed"] += counts["views_failed"]
+        self.report["totals"]["views_unsupported_skipped"] += counts["views_unsupported_skipped"]
+        self.report["totals"]["views_total_skipped"] += (
+            counts["views_unsupported_skipped"] + counts["views_skipped_existing"]
+        )
+
+        LOGGER.info(
+            "Views for table %s: total=%s, migrated=%s, created=%s, adopted_existing=%s, "
+            "skipped_existing=%s, failed=%s, unsupported_skipped=%s",
+            airtable_table_id,
+            total_views,
+            counts["views_migrated"],
+            counts["views_created"],
+            counts["views_adopted_existing"],
+            counts["views_skipped_existing"],
+            counts["views_failed"],
+            counts["views_unsupported_skipped"],
+        )
 
     def migrate_rows_phase_a(self, base_id: str, table: Dict[str, Any]) -> None:
         airtable_table_id = table["id"]
@@ -2022,18 +2444,48 @@ class Migrator:
                         {"base_id": base_id, "table_id": table.get("id")},
                     )
 
+    def migrate_views(self, plan: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> None:
+        for base, tables in plan:
+            base_id = base["id"]
+            LOGGER.info("Migrating views for base %s (%s)", base.get("name", base_id), base_id)
+            for table in tables:
+                airtable_table_id = table.get("id")
+                if not airtable_table_id:
+                    continue
+                try:
+                    baserow_table_id = self.mapping.get_table(airtable_table_id)
+                    if not baserow_table_id:
+                        self._add_error(
+                            "migrate_views",
+                            "Missing Baserow table mapping for view migration",
+                            {"base_id": base_id, "table_id": airtable_table_id},
+                        )
+                        continue
+                    self.migrate_views_for_table(base_id, table, baserow_table_id)
+                except Exception as exc:
+                    self._add_error(
+                        "migrate_views",
+                        str(exc)[:300],
+                        {"base_id": base_id, "table_id": airtable_table_id},
+                    )
+
     def run(self) -> None:
         try:
             plan = self.create_schema()
             self.migrate_data(plan)
+            self.migrate_views(plan)
             totals = self.report["totals"]
             error_count = len(self.report["errors"])
             if error_count:
                 LOGGER.warning(
                     "Migration completed with %s error(s). "
-                    "rows_failed=%s, fields_failed=%s, link_patches_failed=%s. "
+                    "rows_failed=%s, fields_failed=%s, link_patches_failed=%s, views_failed=%s. "
                     "See migration report for details.",
-                    error_count, totals["rows_failed"], totals["fields_failed"], totals["link_patches_failed"],
+                    error_count,
+                    totals["rows_failed"],
+                    totals["fields_failed"],
+                    totals["link_patches_failed"],
+                    totals["views_failed"],
                 )
             else:
                 LOGGER.info("Migration completed successfully with zero errors.")
