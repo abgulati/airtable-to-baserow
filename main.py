@@ -960,10 +960,18 @@ class Migrator:
         payload = self.airtable_get(f"/v0/meta/bases/{base_id}/tables")
         return payload.get("tables", [])
     
-    def get_airtable_views(self, base_id: str, table_id: str) -> List[Dict[str, Any]]:
-        """Fetch all views for an Airtable table."""
-        payload = self.airtable_get(f"/v0/meta/bases/{base_id}/tables/{quote(table_id, safe='')}/views")
-        return payload.get("views", [])
+    def get_airtable_views(self, table: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Extract Airtable views from the table schema payload."""
+        views = table.get("views", [])
+        if views is None:
+            return []
+        if isinstance(views, list):
+            return views
+        LOGGER.warning(
+            "Airtable schema returned a non-list views payload for table %s; skipping view migration for this table.",
+            table.get("id"),
+        )
+        return []
 
     def _plan_snapshot_field(
         self,
@@ -2961,7 +2969,7 @@ class Migrator:
         """Migrate all views for a single table."""
         airtable_table_id = table["id"]
         table_report = self._table_report(base_id, airtable_table_id)
-        airtable_views = self.get_airtable_views(base_id, airtable_table_id)
+        airtable_views = self.get_airtable_views(table)
         total_views = len(airtable_views)
         baserow_views = [] if self.config.dry_run else self.get_baserow_views(baserow_table_id)
         counts = {
@@ -3927,9 +3935,16 @@ class Migrator:
                 airtable_table_id = table.get("id")
                 if not airtable_table_id:
                     continue
+                table_report = self._table_report(
+                    base_id,
+                    airtable_table_id,
+                    table.get("name", airtable_table_id),
+                )
                 try:
                     baserow_table_id = self.mapping.get_table(airtable_table_id)
                     if not baserow_table_id:
+                        table_report["views_failed"] += 1
+                        self.report["totals"]["views_failed"] += 1
                         self._add_error(
                             "migrate_views",
                             "Missing Baserow table mapping for view migration",
@@ -3938,6 +3953,8 @@ class Migrator:
                         continue
                     self.migrate_views_for_table(base_id, table, baserow_table_id)
                 except Exception as exc:
+                    table_report["views_failed"] += 1
+                    self.report["totals"]["views_failed"] += 1
                     self._add_error(
                         "migrate_views",
                         str(exc)[:300],
