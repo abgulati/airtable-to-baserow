@@ -254,3 +254,29 @@ The `field_mappings` section records the Airtable source type, the selected Base
     ```
 
   5. Start VM in Hyper-V, set resolution in popup
+
+- Copying large `migration_report.json` files out of the VM:
+
+  1. Actually copying the contents to the clipboard - the report may be too large for a Select-All!
+
+    - In this case, it's best to use a command-line utility like `xclip`:
+    ```
+    # Install:
+    sudo apt install xclip
+
+    # Copy:
+    cat migration_report.json | xclip -selection clipboard
+    ```
+
+    - This should place the report's contents onto the clipboard
+    
+  2. Actually getting the report contents out of the VM:
+  
+    - Enhanced mode is hit and miss with copy-pasting, and a large report makes this experience worse.
+
+    - In some cases, the report may be too large for the clipboard at all!
+
+    - Even sites like `pastebin.com` etc have a size limit!
+
+    - In these cases, the only easy method is to simply use your email to attach & send the JSON! 
+  
