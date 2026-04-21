@@ -75,6 +75,8 @@ Key features:
 
 3. Baserow auth
 
+  - `BASEROW_WORKSPACE_ID` can be obtained from the URL in the browser's address bar: `http://localhost/workspace/33` (workspace ID is 33 here)
+
   - Obtain `BASEROW_DATABASE_TOKEN` - Navigate to Baserow in the browser:
   ```text
    http://localhost -> Workspace Name Icon (top-left) -> My Settings -> Database Tokens
@@ -147,6 +149,9 @@ Baserow requires the first field in every table to be text-like. When an Airtabl
 - Dry runs use an in-memory mapping store and do not pollute the on-disk SQLite mapping database.
 - Stored base and table mappings are live-validated against the current Baserow workspace and database before reuse. If a mapped database or table no longer matches the expected live object, the stale mapping is rejected and the migrator re-adopts by live name or recreates as needed.
 - Stored ordinary field mappings are live-validated against the current Baserow schema before reuse. If the mapped field no longer matches the expected name or compatible type, the stale mapping is rejected and the migrator revalidates against the live table schema.
+- Phase A row migration now reserves a per-table internal text field that stores the Airtable record ID in Baserow. Reruns use that marker to re-adopt rows whose earlier create succeeded in Baserow even if the local SQLite mapping missed the response.
+- Mutating Baserow writes are no longer retried blindly on ambiguous failures. Batch row creates first reconcile against the live Baserow row-identity marker and only replay still-unmapped rows individually; batch link patches still fail closed and are reported instead of being replayed automatically.
+- Claimed reverse link fields now persist the live Baserow field identity and live field name, so reruns can safely reuse Baserow auto-created inverse relations without invalidating them just because the Airtable-derived desired field name differs.
 - Link patching fails closed when a linked Airtable target row is missing a Baserow row mapping. In that case the row is not patched with a partial relation set, and the missing dependency is reported as an error instead.
 
 ## Known Limits

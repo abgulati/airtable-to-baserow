@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 
 LOGGER = logging.getLogger("airtable_baserow_migrator")
 
+READ_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+ROW_IDENTITY_FIELD_BASENAME = "__air2base_airtable_record_id"
+
 BASEROW_SELECT_COLORS = [
     "light-blue", "light-green", "light-orange", "light-red",
     "light-yellow", "light-gray", "light-cyan", "light-pink",
@@ -57,6 +60,25 @@ def _normalize_link_row_table_id(raw: Any) -> Optional[int]:
         except ValueError:
             return None
     return None
+
+
+def _extract_http_status(error: Exception) -> Optional[int]:
+    match = re.search(r"->\s*(\d{3})\s*:", str(error))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _is_select_option_validation_error(error: Exception) -> bool:
+    return "not a valid select option" in str(error).lower()
+
+
+def _is_ambiguous_write_error(error: Exception) -> bool:
+    status_code = _extract_http_status(error)
+    return status_code is None or status_code in {408, 429, 500, 502, 503, 504}
 
 
 def _sanitize_name(name: str, fallback: str) -> str:
@@ -318,7 +340,9 @@ class MappingStore:
                 airtable_base_id TEXT NOT NULL,
                 airtable_table_id TEXT PRIMARY KEY,
                 airtable_table_name TEXT NOT NULL,
-                baserow_table_id INTEGER NOT NULL
+                baserow_table_id INTEGER NOT NULL,
+                row_identity_field_id INTEGER,
+                row_identity_field_name TEXT
             );
             CREATE TABLE IF NOT EXISTS field_map (
                 airtable_table_id TEXT NOT NULL,
@@ -328,6 +352,7 @@ class MappingStore:
                 baserow_field_name TEXT NOT NULL,
                 baserow_field_type TEXT NOT NULL,
                 reverse_baserow_field_id INTEGER,
+                adopted_reverse_field INTEGER NOT NULL DEFAULT 0,
                 linked_target_airtable_table_id TEXT,
                 PRIMARY KEY (airtable_table_id, airtable_field_id)
             );
@@ -349,13 +374,28 @@ class MappingStore:
                 skip_reason TEXT,
                 PRIMARY KEY (airtable_table_id, airtable_view_id)
             );
+            CREATE TABLE IF NOT EXISTS file_upload_map (
+                local_file_path TEXT PRIMARY KEY,
+                baserow_file_payload TEXT NOT NULL
+            );
             """
         )
+        table_map_columns = {
+            row[1] for row in self.conn.execute("PRAGMA table_info(table_map)").fetchall()
+        }
+        if "row_identity_field_id" not in table_map_columns:
+            self.conn.execute("ALTER TABLE table_map ADD COLUMN row_identity_field_id INTEGER")
+        if "row_identity_field_name" not in table_map_columns:
+            self.conn.execute("ALTER TABLE table_map ADD COLUMN row_identity_field_name TEXT")
         field_map_columns = {
             row[1] for row in self.conn.execute("PRAGMA table_info(field_map)").fetchall()
         }
         if "reverse_baserow_field_id" not in field_map_columns:
             self.conn.execute("ALTER TABLE field_map ADD COLUMN reverse_baserow_field_id INTEGER")
+        if "adopted_reverse_field" not in field_map_columns:
+            self.conn.execute(
+                "ALTER TABLE field_map ADD COLUMN adopted_reverse_field INTEGER NOT NULL DEFAULT 0"
+            )
         self.conn.commit()
 
     def close(self) -> None:
@@ -395,6 +435,19 @@ class MappingStore:
         ).fetchone()
         return row[0] if row else None
 
+    def get_table_row_identity_field(self, airtable_table_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT row_identity_field_id, row_identity_field_name
+            FROM table_map
+            WHERE airtable_table_id = ?
+            """,
+            (airtable_table_id,),
+        ).fetchone()
+        if not row or (row[0] is None and row[1] is None):
+            return None
+        return {"field_id": row[0], "field_name": row[1]}
+
     def set_table(
         self,
         airtable_base_id: str,
@@ -415,6 +468,22 @@ class MappingStore:
         )
         self.conn.commit()
 
+    def set_table_row_identity_field(
+        self,
+        airtable_table_id: str,
+        row_identity_field_id: int,
+        row_identity_field_name: str,
+    ) -> None:
+        self.conn.execute(
+            """
+            UPDATE table_map
+            SET row_identity_field_id = ?, row_identity_field_name = ?
+            WHERE airtable_table_id = ?
+            """,
+            (row_identity_field_id, row_identity_field_name, airtable_table_id),
+        )
+        self.conn.commit()
+
     def set_field(
         self,
         airtable_table_id: str,
@@ -425,21 +494,23 @@ class MappingStore:
         baserow_field_type: str,
         linked_target_airtable_table_id: Optional[str],
         reverse_baserow_field_id: Optional[int] = None,
+        adopted_reverse_field: bool = False,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO field_map
             (airtable_table_id, airtable_field_id, airtable_field_name, baserow_field_id,
              baserow_field_name, baserow_field_type, linked_target_airtable_table_id,
-             reverse_baserow_field_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             reverse_baserow_field_id, adopted_reverse_field)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(airtable_table_id, airtable_field_id) DO UPDATE SET
                 airtable_field_name=excluded.airtable_field_name,
                 baserow_field_id=excluded.baserow_field_id,
                 baserow_field_name=excluded.baserow_field_name,
                 baserow_field_type=excluded.baserow_field_type,
                 linked_target_airtable_table_id=excluded.linked_target_airtable_table_id,
-                reverse_baserow_field_id=excluded.reverse_baserow_field_id
+                reverse_baserow_field_id=excluded.reverse_baserow_field_id,
+                adopted_reverse_field=excluded.adopted_reverse_field
             """,
             (
                 airtable_table_id,
@@ -450,6 +521,7 @@ class MappingStore:
                 baserow_field_type,
                 linked_target_airtable_table_id,
                 reverse_baserow_field_id,
+                1 if adopted_reverse_field else 0,
             ),
         )
         self.conn.commit()
@@ -458,7 +530,8 @@ class MappingStore:
         rows = self.conn.execute(
             """
             SELECT airtable_field_id, airtable_field_name, baserow_field_id, baserow_field_name,
-                 baserow_field_type, linked_target_airtable_table_id, reverse_baserow_field_id
+                  baserow_field_type, linked_target_airtable_table_id, reverse_baserow_field_id,
+                  adopted_reverse_field
             FROM field_map
             WHERE airtable_table_id = ?
             """,
@@ -475,6 +548,7 @@ class MappingStore:
                     "baserow_field_type": row[4],
                     "linked_target_airtable_table_id": row[5],
                     "reverse_baserow_field_id": row[6],
+                    "adopted_reverse_field": bool(row[7]),
                 }
             )
         return output
@@ -499,6 +573,27 @@ class MappingStore:
                 baserow_row_id=excluded.baserow_row_id
             """,
             (airtable_table_id, airtable_record_id, baserow_row_id),
+        )
+        self.conn.commit()
+
+    def get_uploaded_file(self, local_file_path: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT baserow_file_payload FROM file_upload_map WHERE local_file_path = ?",
+            (local_file_path,),
+        ).fetchone()
+        if not row:
+            return None
+        return json.loads(row[0])
+
+    def set_uploaded_file(self, local_file_path: str, baserow_file_payload: Dict[str, Any]) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO file_upload_map (local_file_path, baserow_file_payload)
+            VALUES (?, ?)
+            ON CONFLICT(local_file_path) DO UPDATE SET
+                baserow_file_payload=excluded.baserow_file_payload
+            """,
+            (local_file_path, json.dumps(baserow_file_payload, ensure_ascii=True, sort_keys=True)),
         )
         self.conn.commit()
 
@@ -747,17 +842,33 @@ class Migrator:
         url: str,
         headers: Dict[str, str],
         expected_statuses: Iterable[int],
+        retry_statuses: Optional[set[int]] = None,
+        retry_request_exceptions: bool = False,
         **kwargs: Any,
     ) -> requests.Response:
         refreshed_this_call = False
+        retry_statuses = retry_statuses or set()
         for attempt in range(1, 6):
-            resp = self.session.request(
-                method=method,
-                url=url,
-                headers=headers,
-                timeout=self.config.request_timeout,
-                **kwargs,
-            )
+            try:
+                resp = self.session.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    timeout=self.config.request_timeout,
+                    **kwargs,
+                )
+            except requests.RequestException as exc:
+                if retry_request_exceptions and attempt < 5:
+                    sleep_seconds = 2 ** attempt
+                    LOGGER.warning(
+                        "Retrying %s after request error %s in %ss",
+                        url,
+                        exc.__class__.__name__,
+                        sleep_seconds,
+                    )
+                    time.sleep(sleep_seconds)
+                    continue
+                raise RuntimeError(f"Request failed: {method} {url} -> request error: {exc}") from exc
             if resp.status_code in expected_statuses:
                 return resp
             if resp.status_code == 401 and not refreshed_this_call:
@@ -766,7 +877,7 @@ class Migrator:
                     headers = {k: v for k, v in headers.items()}
                     headers["Authorization"] = f"{self._token_type} {self._management_token}"
                     continue
-            if resp.status_code in {409, 429, 500, 502, 503, 504} and attempt < 5:
+            if resp.status_code in retry_statuses and attempt < 5:
                 sleep_seconds = 2 ** attempt
                 LOGGER.warning("Retrying %s after HTTP %s in %ss", url, resp.status_code, sleep_seconds)
                 time.sleep(sleep_seconds)
@@ -783,6 +894,8 @@ class Migrator:
             url,
             headers=self._airtable_headers(),
             expected_statuses={200},
+            retry_statuses=READ_RETRY_STATUS_CODES,
+            retry_request_exceptions=True,
             params=params,
         )
         return resp.json()
@@ -791,11 +904,14 @@ class Migrator:
         self, method: str, path: str, expected_statuses: Iterable[int], json_body: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         url = f"{self.config.baserow_url}{path}"
+        is_read_request = method.upper() == "GET"
         resp = self._request_with_retries(
             method,
             url,
             headers=self._baserow_management_headers(),
             expected_statuses=expected_statuses,
+            retry_statuses=READ_RETRY_STATUS_CODES if is_read_request else None,
+            retry_request_exceptions=is_read_request,
             data=json.dumps(json_body) if json_body is not None else None,
         )
         return resp.json() if resp.text.strip() else {}
@@ -810,11 +926,14 @@ class Migrator:
         url = f"{self.config.baserow_url}{path}"
         headers = self._baserow_row_headers()
         headers["Content-Type"] = "application/json"
+        is_read_request = method.upper() == "GET"
         resp = self._request_with_retries(
             method,
             url,
             headers=headers,
             expected_statuses=expected_statuses,
+            retry_statuses=READ_RETRY_STATUS_CODES if is_read_request else None,
+            retry_request_exceptions=is_read_request,
             data=json.dumps(json_body) if json_body is not None else None,
         )
         return resp.json() if resp.text.strip() else {}
@@ -1426,6 +1545,133 @@ class Migrator:
             return payload
         return payload.get("results", [])
 
+    def iter_baserow_rows(self, table_id: int) -> Iterable[Dict[str, Any]]:
+        page = 1
+        while True:
+            payload = self.baserow_row_request(
+                "GET",
+                f"/api/database/rows/table/{table_id}/?user_field_names=true&size=200&page={page}",
+                {200},
+            )
+            if isinstance(payload, list):
+                rows = payload
+                next_page = None
+            else:
+                rows = payload.get("results", [])
+                next_page = payload.get("next")
+            if not rows:
+                break
+            for row in rows:
+                yield row
+            if not next_page:
+                break
+            page += 1
+
+    def _iter_row_identity_field_candidates(self) -> Iterable[str]:
+        yield ROW_IDENTITY_FIELD_BASENAME
+        for index in range(2, 100):
+            yield f"{ROW_IDENTITY_FIELD_BASENAME}_{index}"
+
+    def _ensure_row_identity_field(self, airtable_table_id: str, baserow_table_id: int) -> str:
+        stored_field = self.mapping.get_table_row_identity_field(airtable_table_id)
+        existing_fields = [] if self.config.dry_run else self.get_baserow_fields(baserow_table_id)
+        existing_fields_by_id = {
+            int(field["id"]): field for field in existing_fields if field.get("id") is not None
+        }
+
+        if stored_field:
+            stored_field_id = stored_field.get("field_id")
+            stored_field_name = stored_field.get("field_name")
+            if self.config.dry_run and stored_field_name:
+                return str(stored_field_name)
+            if stored_field_id is not None:
+                live_field = existing_fields_by_id.get(int(stored_field_id))
+                if live_field and live_field.get("name") == stored_field_name and live_field.get("type") == "text":
+                    self.mapping.set_table_row_identity_field(
+                        airtable_table_id,
+                        int(stored_field_id),
+                        str(stored_field_name),
+                    )
+                    return str(stored_field_name)
+            if stored_field_name:
+                for existing_field in existing_fields:
+                    if existing_field.get("name") == stored_field_name and existing_field.get("type") == "text":
+                        self.mapping.set_table_row_identity_field(
+                            airtable_table_id,
+                            int(existing_field["id"]),
+                            str(stored_field_name),
+                        )
+                        return str(stored_field_name)
+
+        for candidate_name in self._iter_row_identity_field_candidates():
+            if self.config.dry_run:
+                self.mapping.set_table_row_identity_field(
+                    airtable_table_id,
+                    self._next_fake_id(),
+                    candidate_name,
+                )
+                return candidate_name
+            try:
+                field_id, _created_new_field = self._ensure_named_field(
+                    baserow_table_id=baserow_table_id,
+                    baserow_field_name=candidate_name,
+                    baserow_type="text",
+                    extra={},
+                    existing_fields=existing_fields,
+                )
+            except RuntimeError as exc:
+                if "Existing Baserow field mismatch" in str(exc):
+                    continue
+                raise
+            self.mapping.set_table_row_identity_field(airtable_table_id, field_id, candidate_name)
+            return candidate_name
+
+        raise RuntimeError(
+            f"Unable to reserve a row identity field for Airtable table {airtable_table_id}"
+        )
+
+    def _get_baserow_row_identity_map(
+        self,
+        baserow_table_id: int,
+        row_identity_field_name: str,
+        airtable_record_ids: Optional[Iterable[str]] = None,
+    ) -> Dict[str, int]:
+        record_filter = set(airtable_record_ids or [])
+        filter_enabled = bool(record_filter)
+        identity_map: Dict[str, int] = {}
+        for row in self.iter_baserow_rows(baserow_table_id):
+            raw_marker = row.get(row_identity_field_name)
+            if raw_marker is None:
+                continue
+            marker = str(raw_marker).strip()
+            if not marker:
+                continue
+            if filter_enabled and marker not in record_filter:
+                continue
+            row_id = row.get("id")
+            if row_id is None:
+                continue
+            identity_map[marker] = int(row_id)
+            if filter_enabled and len(identity_map) == len(record_filter):
+                break
+        return identity_map
+
+    def _reconcile_row_mappings(
+        self,
+        airtable_table_id: str,
+        baserow_table_id: int,
+        row_identity_field_name: str,
+        airtable_record_ids: Iterable[str],
+    ) -> Dict[str, int]:
+        reconciled_rows = self._get_baserow_row_identity_map(
+            baserow_table_id,
+            row_identity_field_name,
+            airtable_record_ids,
+        )
+        for airtable_record_id, baserow_row_id in reconciled_rows.items():
+            self.mapping.set_record(airtable_table_id, airtable_record_id, baserow_row_id)
+        return reconciled_rows
+
     def _extract_application_workspace_id(self, application: Dict[str, Any]) -> Optional[int]:
         workspace = application.get("workspace")
         if isinstance(workspace, dict) and workspace.get("id") is not None:
@@ -1956,12 +2202,17 @@ class Migrator:
             actual_field = existing_fields_by_id.get(field_id)
             actual_name = actual_field.get("name") if actual_field else None
             actual_type = actual_field.get("type") if actual_field else None
+            stored_live_field_name = known_field["baserow_field_name"]
+            allow_live_name_reuse = bool(known_field.get("adopted_reverse_field"))
             actual_target_table_id = _normalize_link_row_table_id(
                 actual_field.get("link_row_table_id") if actual_field else None
             )
             if (
                 actual_field
-                and actual_name == baserow_field_name
+                and (
+                    actual_name == baserow_field_name
+                    or (allow_live_name_reuse and actual_name == stored_live_field_name)
+                )
                 and actual_type == "link_row"
                 and actual_target_table_id == target_baserow_table_id
             ):
@@ -1977,10 +2228,11 @@ class Migrator:
                     airtable_field["id"],
                     airtable_field.get("name", airtable_field["id"]),
                     field_id,
-                    baserow_field_name,
+                    actual_name or baserow_field_name,
                     "link_row",
                     linked_target_airtable_table_id,
                     reverse_field_id,
+                    allow_live_name_reuse,
                 )
                 return LinkFieldResult(field_id, False, reverse_field_id)
 
@@ -2004,6 +2256,7 @@ class Migrator:
                     "baserow_table_id": baserow_table_id,
                     "baserow_field_id": field_id,
                     "expected_baserow_field_name": baserow_field_name,
+                    "stored_baserow_field_name": stored_live_field_name,
                     "actual_baserow_field_name": actual_name,
                     "expected_baserow_field_type": "link_row",
                     "actual_baserow_field_type": actual_type,
@@ -2021,6 +2274,7 @@ class Migrator:
                 "link_row",
                 linked_target_airtable_table_id,
                 None,
+                False,
             )
             known_field = None
 
@@ -2227,6 +2481,12 @@ class Migrator:
             baserow_table_id, target_baserow_table_id,
         )
         return None
+
+    def _get_baserow_field_by_id(self, baserow_table_id: int, field_id: int) -> Optional[Dict[str, Any]]:
+        for field in self.get_baserow_fields(baserow_table_id):
+            if int(field["id"]) == field_id:
+                return field
+        return None
     
     def create_baserow_view(
         self,
@@ -2323,7 +2583,15 @@ class Migrator:
             table_report["attachments_reused_from_cache"] += 1
             self.report["totals"]["attachments_reused_from_cache"] += 1
             return destination
-        resp = self._request_with_retries("GET", url, headers={}, expected_statuses={200}, stream=True)
+        resp = self._request_with_retries(
+            "GET",
+            url,
+            headers={},
+            expected_statuses={200},
+            retry_statuses=READ_RETRY_STATUS_CODES,
+            retry_request_exceptions=True,
+            stream=True,
+        )
         with destination.open("wb") as fh:
             for chunk in resp.iter_content(chunk_size=1024 * 128):
                 if chunk:
@@ -2335,6 +2603,10 @@ class Migrator:
     def _upload_file_to_baserow(self, file_path: Path, table_report: Dict[str, Any]) -> Dict[str, Any]:
         if self.config.dry_run:
             return {"name": file_path.name}
+        cache_key = str(file_path.resolve()).lower()
+        cached_upload = self.mapping.get_uploaded_file(cache_key)
+        if cached_upload is not None:
+            return cached_upload
         url = f"{self.config.baserow_url}/api/user-files/upload-file/"
         headers = self._baserow_management_headers(content_type_json=False)
         with file_path.open("rb") as fh:
@@ -2345,9 +2617,11 @@ class Migrator:
                 expected_statuses={200, 201},
                 files={"file": (file_path.name, fh)},
             )
+        payload = resp.json()
+        self.mapping.set_uploaded_file(cache_key, payload)
         table_report["files_uploaded_to_baserow"] += 1
         self.report["totals"]["files_uploaded_to_baserow"] += 1
-        return resp.json()
+        return payload
 
     def _transform_output_value(
         self,
@@ -2437,6 +2711,7 @@ class Migrator:
         airtable_table_id: str,
         batch: List[Tuple[str, Dict[str, Any]]],
         table_report: Dict[str, Any],
+        row_identity_field_name: str,
     ) -> int:
         """Send a batch of rows via the Baserow batch create API.
 
@@ -2462,13 +2737,75 @@ class Migrator:
                 self.mapping.set_record(airtable_table_id, airtable_record_id, int(row_data["id"]))
             return len(batch)
         except Exception as batch_exc:
+            if _is_select_option_validation_error(batch_exc):
+                LOGGER.warning(
+                    "Batch create for table %s hit select-option validation; updating options before individual replay",
+                    baserow_table_id,
+                )
+                for _airtable_record_id, row_payload in batch:
+                    self._ensure_select_options(baserow_table_id, row_payload)
+                return self._create_rows_individually(
+                    baserow_table_id,
+                    airtable_table_id,
+                    batch,
+                    table_report,
+                    row_identity_field_name,
+                )
+
+            if _is_ambiguous_write_error(batch_exc):
+                reconciled_rows = self._reconcile_row_mappings(
+                    airtable_table_id,
+                    baserow_table_id,
+                    row_identity_field_name,
+                    [airtable_record_id for airtable_record_id, _ in batch],
+                )
+                if len(reconciled_rows) == len(batch):
+                    LOGGER.warning(
+                        "Batch create for table %s returned an ambiguous failure, but all %s rows were reconciled from live Baserow state.",
+                        baserow_table_id,
+                        len(batch),
+                    )
+                    return len(batch)
+                remaining_batch = [
+                    (airtable_record_id, row_payload)
+                    for airtable_record_id, row_payload in batch
+                    if self.mapping.get_record(airtable_table_id, airtable_record_id) is None
+                ]
+                if remaining_batch:
+                    LOGGER.warning(
+                        "Batch create for table %s failed ambiguously; reconciled %s/%s rows and will replay only the remaining unmapped rows individually.",
+                        baserow_table_id,
+                        len(reconciled_rows),
+                        len(batch),
+                    )
+                    return len(reconciled_rows) + self._create_rows_individually(
+                        baserow_table_id,
+                        airtable_table_id,
+                        remaining_batch,
+                        table_report,
+                        row_identity_field_name,
+                    )
+
+            status_code = _extract_http_status(batch_exc)
             LOGGER.warning(
-                "Batch create failed for table %s (%s items), falling back to individual creation: %s",
-                baserow_table_id, len(batch), str(batch_exc)[:200],
+                "Batch create for table %s failed and will not be replayed automatically to avoid duplicate rows: %s",
+                baserow_table_id,
+                str(batch_exc)[:200],
             )
-            return self._create_rows_individually(
-                baserow_table_id, airtable_table_id, batch, table_report
+            self.report["totals"]["rows_failed"] += len(batch)
+            table_report["rows_failed"] += len(batch)
+            self._add_error(
+                "create_rows_batch",
+                "Batch row create failed and was not replayed automatically to avoid duplicate writes.",
+                {
+                    "airtable_table_id": airtable_table_id,
+                    "baserow_table_id": baserow_table_id,
+                    "record_ids": [airtable_record_id for airtable_record_id, _ in batch],
+                    "status_code": status_code,
+                    "error": str(batch_exc)[:300],
+                },
             )
+            return 0
 
     def _create_rows_individually(
         self,
@@ -2476,6 +2813,7 @@ class Migrator:
         airtable_table_id: str,
         batch: List[Tuple[str, Dict[str, Any]]],
         table_report: Dict[str, Any],
+        row_identity_field_name: str,
     ) -> int:
         """Create rows one at a time with select-option retry.
 
@@ -2493,7 +2831,7 @@ class Migrator:
                         row_payload,
                     )
                 except RuntimeError as exc:
-                    if "not a valid select option" in str(exc).lower():
+                    if _is_select_option_validation_error(exc):
                         LOGGER.info("Missing select option detected, adding options and retrying row")
                         self._ensure_select_options(baserow_table_id, row_payload)
                         row = self.baserow_row_request(
@@ -2502,6 +2840,19 @@ class Migrator:
                             {200, 201},
                             row_payload,
                         )
+                    elif _is_ambiguous_write_error(exc):
+                        reconciled_rows = self._reconcile_row_mappings(
+                            airtable_table_id,
+                            baserow_table_id,
+                            row_identity_field_name,
+                            [airtable_record_id],
+                        )
+                        if reconciled_rows.get(airtable_record_id) is not None:
+                            created += 1
+                            continue
+                        raise RuntimeError(
+                            "Ambiguous row create failed without a reconcilable live row."
+                        ) from exc
                     else:
                         raise
                 self.mapping.set_record(airtable_table_id, airtable_record_id, int(row["id"]))
@@ -2512,7 +2863,11 @@ class Migrator:
                 self._add_error(
                     "create_row",
                     str(exc)[:300],
-                    {"airtable_table_id": airtable_table_id, "airtable_record_id": airtable_record_id},
+                    {
+                        "airtable_table_id": airtable_table_id,
+                        "airtable_record_id": airtable_record_id,
+                        "ambiguous_write": _is_ambiguous_write_error(exc),
+                    },
                 )
         return created
 
@@ -2539,13 +2894,25 @@ class Migrator:
             )
             return len(batch)
         except Exception as batch_exc:
+            status_code = _extract_http_status(batch_exc)
             LOGGER.warning(
-                "Batch link patch failed for table %s (%s items), falling back to individual patches: %s",
-                baserow_table_id, len(batch), str(batch_exc)[:200],
+                "Batch link patch for table %s failed and will not be replayed automatically to avoid duplicate updates: %s",
+                baserow_table_id,
+                str(batch_exc)[:200],
             )
-            return self._patch_links_individually(
-                baserow_table_id, airtable_table_id, batch
+            self.report["totals"]["link_patches_failed"] += len(batch)
+            self._add_error(
+                "patch_links_batch",
+                "Batch link patch failed and was not replayed automatically to avoid duplicate writes.",
+                {
+                    "airtable_table_id": airtable_table_id,
+                    "baserow_table_id": baserow_table_id,
+                    "baserow_row_ids": [baserow_row_id for baserow_row_id, _ in batch],
+                    "status_code": status_code,
+                    "error": str(batch_exc)[:300],
+                },
             )
+            return 0
 
     def _patch_links_individually(
         self,
@@ -2729,9 +3096,21 @@ class Migrator:
         created = 0
         skipped = 0
         pending_batch: List[Tuple[str, Dict[str, Any]]] = []
+        row_identity_field_name = self._ensure_row_identity_field(airtable_table_id, baserow_table_id)
+        existing_row_identity_map: Dict[str, int] = {}
+        if not self.config.dry_run:
+            existing_row_identity_map = self._get_baserow_row_identity_map(
+                baserow_table_id,
+                row_identity_field_name,
+            )
         for record in self.iter_airtable_records(base_id, airtable_table_id):
             airtable_record_id = record["id"]
             if self.mapping.get_record(airtable_table_id, airtable_record_id):
+                skipped += 1
+                continue
+            existing_baserow_row_id = existing_row_identity_map.get(airtable_record_id)
+            if existing_baserow_row_id is not None:
+                self.mapping.set_record(airtable_table_id, airtable_record_id, existing_baserow_row_id)
                 skipped += 1
                 continue
             source_fields = record.get("fields", {})
@@ -2751,6 +3130,7 @@ class Migrator:
                         table_report,
                     )
                 )
+            row_payload[row_identity_field_name] = airtable_record_id
 
             if self.config.dry_run:
                 LOGGER.info("[dry-run] Would create row in table %s with fields: %s", baserow_table_id, list(row_payload))
@@ -2759,14 +3139,22 @@ class Migrator:
             pending_batch.append((airtable_record_id, row_payload))
             if len(pending_batch) >= self.config.batch_size:
                 created += self._create_rows_batch(
-                    baserow_table_id, airtable_table_id, pending_batch, table_report
+                    baserow_table_id,
+                    airtable_table_id,
+                    pending_batch,
+                    table_report,
+                    row_identity_field_name,
                 )
                 pending_batch = []
                 LOGGER.info("Table %s: created %s rows so far", airtable_table_id, created)
 
         if pending_batch:
             created += self._create_rows_batch(
-                baserow_table_id, airtable_table_id, pending_batch, table_report
+                baserow_table_id,
+                airtable_table_id,
+                pending_batch,
+                table_report,
+                row_identity_field_name,
             )
 
         table_report["rows_created"] += created
@@ -3002,6 +3390,7 @@ class Migrator:
                             "baserow_field_type": main_output.baserow_field_type,
                             "linked_target_airtable_table_id": None,
                             "reverse_baserow_field_id": None,
+                            "adopted_reverse_field": False,
                         }
                         for output in resolved_spec.outputs[1:]:
                             _field_id, created_new = self.ensure_auxiliary_field(
@@ -3047,24 +3436,29 @@ class Migrator:
                             )
                         )
                         known_field = known_fields_by_id.get(field["id"], {})
+                        stored_link_field_name = main_output.baserow_field_name
+                        if known_field.get("adopted_reverse_field") and known_field.get("baserow_field_name"):
+                            stored_link_field_name = known_field["baserow_field_name"]
                         self.mapping.set_field(
                             table["id"],
                             field["id"],
                             field.get("name", field["id"]),
                             known_field.get("baserow_field_id"),
-                            main_output.baserow_field_name,
+                            stored_link_field_name,
                             "link_row",
                             linked_target,
                             known_field.get("reverse_baserow_field_id"),
+                            bool(known_field.get("adopted_reverse_field")),
                         )
                         known_fields_by_id[field["id"]] = {
                             "airtable_field_id": field["id"],
                             "airtable_field_name": field.get("name", field["id"]),
                             "baserow_field_id": known_field.get("baserow_field_id"),
-                            "baserow_field_name": main_output.baserow_field_name,
+                            "baserow_field_name": stored_link_field_name,
                             "baserow_field_type": "link_row",
                             "linked_target_airtable_table_id": linked_target,
                             "reverse_baserow_field_id": known_field.get("reverse_baserow_field_id"),
+                            "adopted_reverse_field": bool(known_field.get("adopted_reverse_field")),
                         }
                         self._field_specs.setdefault(table["id"], {})[resolved_spec.airtable_field_id] = resolved_spec
                         continue
@@ -3193,19 +3587,52 @@ class Migrator:
 
                 if field["id"] in pending_reverse_link_claims:
                     claim = pending_reverse_link_claims.pop(field["id"])
+                    live_reverse_field = self._get_baserow_field_by_id(baserow_table_id, claim.reverse_field_id)
+                    live_reverse_target_table_id = _normalize_link_row_table_id(
+                        live_reverse_field.get("link_row_table_id") if live_reverse_field else None
+                    )
+                    if (
+                        not live_reverse_field
+                        or live_reverse_field.get("type") != "link_row"
+                        or live_reverse_target_table_id != claim.source_baserow_table_id
+                    ):
+                        self.report["totals"]["fields_failed"] += 1
+                        self._add_error(
+                            "create_link_field",
+                            "Claimed reverse link field no longer matches the live Baserow schema",
+                            {
+                                "airtable_table_id": airtable_table_id,
+                                "airtable_field_id": field["id"],
+                                "field_name": field.get("name", field["id"]),
+                                "baserow_table_id": baserow_table_id,
+                                "claimed_reverse_field_id": claim.reverse_field_id,
+                                "actual_reverse_field_name": live_reverse_field.get("name") if live_reverse_field else None,
+                                "actual_reverse_field_type": live_reverse_field.get("type") if live_reverse_field else None,
+                                "expected_target_baserow_table_id": claim.source_baserow_table_id,
+                                "actual_target_baserow_table_id": live_reverse_target_table_id,
+                            },
+                        )
+                        self._finalize_field_mapping(
+                            airtable_table_id,
+                            field["id"],
+                            status="failed",
+                            status_reason="Claimed reverse link field no longer matched the live Baserow relation.",
+                        )
+                        continue
                     self.mapping.set_field(
                         airtable_table_id,
                         field["id"],
                         field.get("name", field["id"]),
                         claim.reverse_field_id,
-                        baserow_field_name,
+                        live_reverse_field.get("name", baserow_field_name),
                         "link_row",
                         linked_target,
                         claim.source_baserow_field_id,
+                        True,
                     )
                     LOGGER.info(
                         "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
-                        baserow_field_name, claim.reverse_field_id, baserow_table_id,
+                        live_reverse_field.get("name", baserow_field_name), claim.reverse_field_id, baserow_table_id,
                     )
                     self._finalize_field_mapping(airtable_table_id, field["id"])
                     continue
