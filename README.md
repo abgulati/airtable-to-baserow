@@ -17,9 +17,36 @@ Key features:
 
 2. `uv` installed:
 
-  ```
-  python -m pip install --user uv
-  ```
+  - NOTE: Modern Linux distributions (like Ubuntu 23.04+ or Debian 12+) now block pip install outside of a virtual environment to prevent you from accidentally breaking system tools. As a result, typical attempts like `python -m pip install --user uv` might fail!
+
+  - There are a few options:
+
+    - Option 1: The Recommended Way (Using pipx)
+    ```
+    # 1. Install pipx:
+    sudo apt update
+    sudo apt install pipx
+    pipx ensurepath
+
+    #2. Install uv:
+    pipx install uv
+    ```
+
+    - Option 2: The "Official" uv Way (Even Faster)
+    ```
+    # The creators of uv actually recommend installing it via their standalone script, which bypasses the Python environment headache entirely:
+
+    curl -LsSf https://astral.sh | sh
+    ```
+
+    - Option 3: The Virtual Environment Way
+    ```
+    # If you specifically want uv only for the project you are currently sitting in:
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install uv
+    ```
 
 3. Docker installed and available on PATH: https://docs.docker.com/engine/install/ubuntu/ (as per your platform)
 
@@ -34,7 +61,7 @@ Key features:
 
 - From the project directory:
   ```
-  python -m uv sync
+  uv sync
   ```
 
 - This creates/updates `.venv` and installs dependencies pinned by `uv.lock`.
@@ -163,19 +190,19 @@ Baserow requires the first field in every table to be text-like. When an Airtabl
 ## Run
 
 ```powershell
-python -m uv run python .\main.py --log-level INFO
+uv run python .\main.py --log-level INFO
 ```
 
 Dry run (no writes to Baserow):
 
 ```powershell
-python -m uv run python .\main.py --dry-run --log-level DEBUG
+uv run python .\main.py --dry-run --log-level DEBUG
 ```
 
 Specify report output path at runtime:
 
 ```powershell
-python -m uv run python .\main.py --report-path .\migration_report.json
+uv run python .\main.py --report-path .\migration_report.json
 ```
 
 ## Report Output
@@ -190,3 +217,40 @@ python -m uv run python .\main.py --report-path .\migration_report.json
 
 The `field_mappings` section records the Airtable source type, the selected Baserow output fields, the transform policy, the fidelity class, the resolution status, and any reported degradation or failure reason for each migrated field.
 
+## Hyper-V / VM Recommendations:
+
+- Enable Enhanced Mode:
+
+  1. Install dependencies (in the Ubuntu VM):
+  ```
+  sudo apt install -y linux-tools-virtual linux-cloud-tools-virtual xrdp
+  ```
+
+  2. Shut down the VM
+
+  3. Enable Enhanced Session Mode in Hyper-V:
+  ```
+  Hyper-V Manager Main Screen -> Hyper-V Settings (right-pane) -> Enhanced Session Mode Policy (left-pane) -> Allow
+  ```
+
+  4. Set VM to use Enhanced Mode:
+  
+    - Open an Admin Powershell:
+    ```
+    Start Menu -> Powershell -> Run as Administrator
+
+    OR
+
+    Task Manager (Ctrl + Shift + Esc) -> Run New Task (Check 'Run as Admin') -> powershell
+    ```
+
+    - Run:
+    ```
+    Set-VM "<name>" -EnhancedSessionTransportType HvSocket
+    ```
+    Example:
+    ```
+    Set-VM "Baserow" -EnhancedSessionTransportType HvSocket
+    ```
+
+  5. Start VM in Hyper-V, set resolution in popup
