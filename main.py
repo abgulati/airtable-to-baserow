@@ -82,6 +82,137 @@ def _unique_name(candidate: str, used: set[str]) -> str:
         idx += 1
 
 
+def _extract_number_decimal_places(options: Dict[str, Any], default: int = 0) -> int:
+    precision = options.get("precision")
+    if precision is None and isinstance(options.get("result"), dict):
+        precision = options["result"].get("precision")
+    if isinstance(precision, int):
+        return max(0, min(precision, 8))
+    return default
+
+
+def _extract_date_include_time(field_type: str, options: Dict[str, Any]) -> bool:
+    if field_type == "date":
+        return False
+    if field_type == "dateTime":
+        return True
+    if isinstance(options.get("result"), dict):
+        result = options["result"]
+        if result.get("type") == "dateTime" or "timeFormat" in result:
+            return True
+    return "timeFormat" in options or field_type in {"createdTime", "lastModifiedTime"}
+
+
+def _extract_result_type(options: Dict[str, Any]) -> Optional[str]:
+    result = options.get("result")
+    if isinstance(result, dict):
+        result_type = result.get("type")
+        if isinstance(result_type, str) and result_type.strip():
+            return result_type.strip()
+    return None
+
+
+def _serialize_json_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=True, sort_keys=True)
+
+
+def _project_collaborator_value(value: Any) -> Optional[str]:
+    if not isinstance(value, dict):
+        return None
+    for key in ("email", "name", "id"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            return text
+    return None
+
+
+def _render_readable_text_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        collaborator_text = _project_collaborator_value(value)
+        if collaborator_text:
+            return collaborator_text
+        if "filename" in value:
+            filename = str(value.get("filename", "")).strip()
+            if filename:
+                return filename
+        if "label" in value or "url" in value:
+            label = str(value.get("label", "")).strip()
+            url = str(value.get("url", "")).strip()
+            if label and url:
+                return f"{label}: {url}"
+            if label:
+                return label
+            if url:
+                return url
+        return _serialize_json_value(value)
+    if isinstance(value, list):
+        projected_parts: List[str] = []
+        for item in value:
+            rendered = _render_readable_text_value(item)
+            if rendered is None:
+                continue
+            rendered = rendered.strip()
+            if rendered:
+                projected_parts.append(rendered)
+        if projected_parts:
+            return ", ".join(projected_parts)
+        return _serialize_json_value(value)
+    return str(value)
+
+
+@dataclass(frozen=True)
+class FieldOutputPlan:
+    suffix: str
+    baserow_field_type: str
+    extra: Dict[str, Any]
+    transform: str
+
+
+@dataclass(frozen=True)
+class FieldMigrationPlan:
+    airtable_field_type: str
+    fidelity: str
+    outputs: Tuple[FieldOutputPlan, ...]
+    defer_link: bool = False
+    linked_target_airtable_table_id: Optional[str] = None
+    inverse_link_airtable_field_id: Optional[str] = None
+    report_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ResolvedFieldOutput:
+    baserow_field_name: str
+    baserow_field_type: str
+    extra: Dict[str, Any]
+    transform: str
+
+
+@dataclass(frozen=True)
+class ResolvedFieldMigrationSpec:
+    airtable_field_id: str
+    airtable_field_name: str
+    airtable_field_type: str
+    fidelity: str
+    outputs: Tuple[ResolvedFieldOutput, ...]
+    defer_link: bool = False
+    linked_target_airtable_table_id: Optional[str] = None
+    inverse_link_airtable_field_id: Optional[str] = None
+    report_reason: Optional[str] = None
+
+
 @dataclass(frozen=True)
 class Config:
     airtable_pat: str
@@ -443,6 +574,7 @@ class Migrator:
         self._fake_id_counter = 10_000
         self.base_names: Dict[str, str] = {}
         self.table_names: Dict[str, str] = {}
+        self._field_specs: Dict[str, Dict[str, ResolvedFieldMigrationSpec]] = {}
         self._management_token = config.baserow_management_token
         self._refresh_token = config.baserow_refresh_token
         self._token_type = config.baserow_management_token_type
@@ -468,6 +600,10 @@ class Migrator:
                 "files_failed": 0,
                 "rows_failed": 0,
                 "fields_failed": 0,
+                "fields_direct": 0,
+                "fields_snapshot": 0,
+                "fields_auxiliary": 0,
+                "fields_unsupported": 0,
                 "link_patches_failed": 0,
                 "views_total": 0,
                 "views_migrated": 0,
@@ -518,6 +654,11 @@ class Migrator:
                 "baserow_table_id": None,
                 "fields_created": 0,
                 "link_fields_created": 0,
+                "fields_direct": 0,
+                "fields_snapshot": 0,
+                "fields_auxiliary": 0,
+                "fields_unsupported": 0,
+                "field_mappings": [],
                 "rows_created": 0,
                 "rows_skipped_existing": 0,
                 "rows_patched_links": 0,
@@ -699,55 +840,453 @@ class Migrator:
         payload = self.airtable_get(f"/v0/meta/bases/{base_id}/tables/{quote(table_id, safe='')}/views")
         return payload.get("views", [])
 
-    def map_field_definition(self, field: Dict[str, Any]) -> Tuple[str, Dict[str, Any], bool]:
+    def _plan_snapshot_field(
+        self,
+        airtable_field_type: str,
+        result_type: Optional[str],
+        options: Dict[str, Any],
+        default_reason: str,
+    ) -> FieldMigrationPlan:
+        if result_type in {"singleLineText", "email", "url", "phoneNumber"}:
+            return FieldMigrationPlan(
+                airtable_field_type=airtable_field_type,
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "text", {}, "text_snapshot"),),
+                report_reason=default_reason,
+            )
+        if result_type in {"multilineText", "richText"}:
+            return FieldMigrationPlan(
+                airtable_field_type=airtable_field_type,
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "long_text", {}, "text_snapshot"),),
+                report_reason=default_reason,
+            )
+        if result_type in {"number", "currency", "percent", "rating", "duration", "autoNumber", "count"}:
+            decimals = _extract_number_decimal_places(options, 0)
+            if result_type in {"rating", "duration", "autoNumber", "count"}:
+                decimals = 0
+            return FieldMigrationPlan(
+                airtable_field_type=airtable_field_type,
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "number", {"number_decimal_places": decimals}, "number"),),
+                report_reason=default_reason,
+            )
+        if result_type == "checkbox":
+            return FieldMigrationPlan(
+                airtable_field_type=airtable_field_type,
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "boolean", {}, "boolean"),),
+                report_reason=default_reason,
+            )
+        if result_type in {"date", "dateTime", "createdTime", "lastModifiedTime"}:
+            return FieldMigrationPlan(
+                airtable_field_type=airtable_field_type,
+                fidelity="snapshot",
+                outputs=(
+                    FieldOutputPlan(
+                        "",
+                        "date",
+                        {"date_include_time": _extract_date_include_time(result_type, options)},
+                        "date",
+                    ),
+                ),
+                report_reason=default_reason,
+            )
+        return FieldMigrationPlan(
+            airtable_field_type=airtable_field_type,
+            fidelity="snapshot",
+            outputs=(FieldOutputPlan("", "long_text", {}, "text_snapshot"),),
+            report_reason=default_reason,
+        )
+
+    def _plan_rollup_field(self, options: Dict[str, Any]) -> FieldMigrationPlan:
+        result_type = _extract_result_type(options)
+        if result_type in {
+            "singleLineText", "email", "url", "phoneNumber",
+            "multilineText", "richText", "number", "currency", "percent",
+            "rating", "duration", "autoNumber", "count", "checkbox",
+            "date", "dateTime", "createdTime", "lastModifiedTime",
+        }:
+            return self._plan_snapshot_field(
+                airtable_field_type="rollup",
+                result_type=result_type,
+                options=options,
+                default_reason="Rollup fields are migrated as current-value snapshots.",
+            )
+        return FieldMigrationPlan(
+            airtable_field_type="rollup",
+            fidelity="auxiliary",
+            outputs=(
+                FieldOutputPlan("", "long_text", {}, "text_snapshot"),
+                FieldOutputPlan(" (raw)", "long_text", {}, "json_raw"),
+            ),
+            report_reason="Rollup fields with mixed or structured results are migrated as readable text plus raw JSON snapshots.",
+        )
+
+    def _plan_lookup_field(self, options: Dict[str, Any]) -> FieldMigrationPlan:
+        result_type = _extract_result_type(options)
+        if result_type in {"singleLineText", "email", "url", "phoneNumber", "multilineText", "richText"}:
+            return FieldMigrationPlan(
+                airtable_field_type="multipleLookupValues",
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "long_text", {}, "text_snapshot"),),
+                report_reason="Lookup fields are migrated as readable text snapshots.",
+            )
+        if result_type in {
+            "number", "currency", "percent", "rating", "duration", "autoNumber", "count",
+            "checkbox", "date", "dateTime", "createdTime", "lastModifiedTime",
+        }:
+            return FieldMigrationPlan(
+                airtable_field_type="multipleLookupValues",
+                fidelity="auxiliary",
+                outputs=(
+                    FieldOutputPlan("", "long_text", {}, "text_snapshot"),
+                    FieldOutputPlan(" (raw)", "long_text", {}, "json_raw"),
+                ),
+                report_reason="Lookup fields with non-text scalar results are migrated as readable text plus raw JSON snapshots because Airtable lookup values are multi-value arrays.",
+            )
+        return FieldMigrationPlan(
+            airtable_field_type="multipleLookupValues",
+            fidelity="auxiliary",
+            outputs=(
+                FieldOutputPlan("", "long_text", {}, "text_snapshot"),
+                FieldOutputPlan(" (raw)", "long_text", {}, "json_raw"),
+            ),
+            report_reason="Lookup fields with mixed or structured results are migrated as readable text plus raw JSON snapshots.",
+        )
+
+    def _apply_primary_field_constraints(self, plan: FieldMigrationPlan) -> FieldMigrationPlan:
+        if not plan.outputs or plan.outputs[0].baserow_field_type == "text":
+            return plan
+
+        companion_outputs = [
+            FieldOutputPlan(" (typed)", plan.outputs[0].baserow_field_type, plan.outputs[0].extra, plan.outputs[0].transform)
+        ]
+        for output in plan.outputs[1:]:
+            companion_outputs.append(
+                FieldOutputPlan(output.suffix or " (raw)", output.baserow_field_type, output.extra, output.transform)
+            )
+
+        reason = plan.report_reason or "Baserow requires the primary field to be text."
+        if "primary field" not in reason.lower():
+            reason = f"{reason} Baserow requires the primary field to be text."
+
+        return replace(
+            plan,
+            fidelity="auxiliary",
+            outputs=(FieldOutputPlan("", "text", {}, "text_projection"), *companion_outputs),
+            report_reason=reason,
+        )
+
+    def _resolve_field_migration_spec(
+        self,
+        field: Dict[str, Any],
+        plan: FieldMigrationPlan,
+        desired_name: str,
+        first_field_name: str,
+        used_names: set[str],
+        is_primary: bool,
+    ) -> ResolvedFieldMigrationSpec:
+        resolved_outputs: List[ResolvedFieldOutput] = []
+        effective_plan = self._apply_primary_field_constraints(plan) if is_primary else plan
+        for idx, output in enumerate(effective_plan.outputs):
+            if is_primary and idx == 0:
+                resolved_name = first_field_name
+            else:
+                candidate = _sanitize_name(f"{desired_name}{output.suffix}", desired_name)
+                resolved_name = _unique_name(candidate, used_names)
+            resolved_outputs.append(
+                ResolvedFieldOutput(
+                    baserow_field_name=resolved_name,
+                    baserow_field_type=output.baserow_field_type,
+                    extra=output.extra,
+                    transform=output.transform,
+                )
+            )
+        return ResolvedFieldMigrationSpec(
+            airtable_field_id=field["id"],
+            airtable_field_name=field.get("name", field["id"]),
+            airtable_field_type=effective_plan.airtable_field_type,
+            fidelity=effective_plan.fidelity,
+            outputs=tuple(resolved_outputs),
+            defer_link=effective_plan.defer_link,
+            linked_target_airtable_table_id=effective_plan.linked_target_airtable_table_id,
+            inverse_link_airtable_field_id=effective_plan.inverse_link_airtable_field_id,
+            report_reason=effective_plan.report_reason,
+        )
+
+    def _record_field_mapping(self, base_id: str, table_id: str, table_name: str, spec: ResolvedFieldMigrationSpec) -> None:
+        self._field_specs.setdefault(table_id, {})[spec.airtable_field_id] = spec
+        self._record_field_mapping_report(base_id, table_id, table_name, spec)
+
+    def _record_field_mapping_report(
+        self,
+        base_id: str,
+        table_id: str,
+        table_name: str,
+        spec: ResolvedFieldMigrationSpec,
+        *,
+        status: str = "resolved",
+        status_reason: Optional[str] = None,
+        record_report: bool = True,
+    ) -> None:
+        if not record_report:
+            return
+        table_report = self._table_report(base_id, table_id, table_name)
+        fidelity_key = f"fields_{spec.fidelity}"
+        if status == "resolved" and fidelity_key in self.report["totals"]:
+            self.report["totals"][fidelity_key] += 1
+        if status == "resolved" and fidelity_key in table_report:
+            table_report[fidelity_key] += 1
+        table_report["field_mappings"].append(
+            {
+                "airtable_field_id": spec.airtable_field_id,
+                "airtable_field_name": spec.airtable_field_name,
+                "airtable_field_type": spec.airtable_field_type,
+                "fidelity": spec.fidelity,
+                "status": status,
+                "status_reason": status_reason,
+                "report_reason": spec.report_reason,
+                "outputs": [
+                    {
+                        "baserow_field_name": output.baserow_field_name,
+                        "baserow_field_type": output.baserow_field_type,
+                        "transform": output.transform,
+                    }
+                    for output in spec.outputs
+                ],
+            }
+        )
+
+    def _finalize_field_mapping(
+        self,
+        airtable_table_id: str,
+        airtable_field_id: str,
+        *,
+        status: str = "resolved",
+        status_reason: Optional[str] = None,
+    ) -> None:
+        spec = self._field_specs.get(airtable_table_id, {}).get(airtable_field_id)
+        if spec is None:
+            return
+        base_id = self.mapping.get_base_id_for_table(airtable_table_id) or airtable_table_id
+        table_name = self.table_names.get(airtable_table_id, airtable_table_id)
+        self._record_field_mapping_report(
+            base_id,
+            airtable_table_id,
+            table_name,
+            spec,
+            status=status,
+            status_reason=status_reason,
+        )
+
+    def map_field_definition(self, field: Dict[str, Any]) -> FieldMigrationPlan:
         ftype = field.get("type", "")
         options = field.get("options", {}) or {}
 
-        if ftype in {"singleLineText", "email", "url", "phoneNumber", "createdBy", "lastModifiedBy"}:
-            return "text", {}, False
+        if ftype in {"singleLineText", "email", "url", "phoneNumber"}:
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="direct",
+                outputs=(FieldOutputPlan("", "text", {}, "text"),),
+            )
         if ftype in {"multilineText", "richText"}:
-            return "long_text", {}, False
-        if ftype in {"number", "currency", "percent", "rating", "duration", "autoNumber", "count"}:
-            return "number", {"number_decimal_places": 5}, False
-        if ftype in {"checkbox"}:
-            return "boolean", {}, False
+            fidelity = "direct" if ftype == "multilineText" else "snapshot"
+            report_reason = None if ftype == "multilineText" else "Rich text fields are migrated as markup snapshots."
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity=fidelity,
+                outputs=(FieldOutputPlan("", "long_text", {}, "text_snapshot"),),
+                report_reason=report_reason,
+            )
+        if ftype == "number":
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="direct",
+                outputs=(
+                    FieldOutputPlan(
+                        "",
+                        "number",
+                        {"number_decimal_places": _extract_number_decimal_places(options, 0)},
+                        "number",
+                    ),
+                ),
+            )
+        if ftype == "currency":
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="snapshot",
+                outputs=(
+                    FieldOutputPlan(
+                        "",
+                        "number",
+                        {"number_decimal_places": _extract_number_decimal_places(options, 2)},
+                        "number",
+                    ),
+                ),
+                report_reason="Currency fields are migrated as numeric snapshots without currency display semantics.",
+            )
+        if ftype == "percent":
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="snapshot",
+                outputs=(
+                    FieldOutputPlan(
+                        "",
+                        "number",
+                        {"number_decimal_places": _extract_number_decimal_places(options, 0)},
+                        "number",
+                    ),
+                ),
+                report_reason="Percent fields are migrated as canonical decimal snapshots.",
+            )
+        if ftype in {"rating", "duration", "autoNumber", "count"}:
+            reason = {
+                "rating": "Rating fields are migrated as integer snapshots.",
+                "duration": "Duration fields are migrated as numeric seconds snapshots.",
+                "autoNumber": "Auto-number fields are migrated as numeric snapshots without auto-increment behavior.",
+                "count": "Count fields are migrated as numeric snapshots without derived behavior.",
+            }[ftype]
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "number", {"number_decimal_places": 0}, "number"),),
+                report_reason=reason,
+            )
+        if ftype == "checkbox":
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="direct",
+                outputs=(FieldOutputPlan("", "boolean", {}, "boolean"),),
+            )
         if ftype in {"date", "dateTime", "createdTime", "lastModifiedTime"}:
-            include_time = "timeFormat" in options or ftype in {"dateTime", "createdTime", "lastModifiedTime"}
-            return "date", {"date_include_time": include_time}, False
+            fidelity = "direct" if ftype == "date" else "snapshot"
+            reason = None if ftype == "date" else f"{ftype} fields are migrated as date snapshots."
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity=fidelity,
+                outputs=(
+                    FieldOutputPlan(
+                        "",
+                        "date",
+                        {"date_include_time": _extract_date_include_time(ftype, options)},
+                        "date",
+                    ),
+                ),
+                report_reason=reason,
+            )
         if ftype == "singleSelect":
             choices = [c for c in options.get("choices", []) if (c.get("name") or "").strip()]
-            return (
-                "single_select",
-                {"select_options": [
-                    {"value": c["name"].strip(), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
-                    for i, c in enumerate(choices)
-                ]},
-                False,
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="direct",
+                outputs=(
+                    FieldOutputPlan(
+                        "",
+                        "single_select",
+                        {"select_options": [
+                            {"value": c["name"].strip(), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
+                            for i, c in enumerate(choices)
+                        ]},
+                        "single_select",
+                    ),
+                ),
             )
         if ftype == "multipleSelects":
             choices = [c for c in options.get("choices", []) if (c.get("name") or "").strip()]
-            return (
-                "multiple_select",
-                {"select_options": [
-                    {"value": c["name"].strip(), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
-                    for i, c in enumerate(choices)
-                ]},
-                False,
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="direct",
+                outputs=(
+                    FieldOutputPlan(
+                        "",
+                        "multiple_select",
+                        {"select_options": [
+                            {"value": c["name"].strip(), "color": BASEROW_SELECT_COLORS[i % len(BASEROW_SELECT_COLORS)]}
+                            for i, c in enumerate(choices)
+                        ]},
+                        "multiple_select",
+                    ),
+                ),
             )
         if ftype == "multipleAttachments":
-            return "file", {}, False
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "file", {}, "file"),),
+                report_reason="Attachment fields are migrated as file snapshots.",
+            )
         if ftype == "multipleRecordLinks":
             linked_table_id = options.get("linkedTableId")
-            return (
-                "link_row",
-                {
-                    "linked_target_airtable_table_id": linked_table_id,
-                    "inverse_link_airtable_field_id": options.get("inverseLinkFieldId"),
-                },
-                True,
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="direct",
+                outputs=(FieldOutputPlan("", "link_row", {}, "link_row"),),
+                defer_link=True,
+                linked_target_airtable_table_id=linked_table_id,
+                inverse_link_airtable_field_id=options.get("inverseLinkFieldId"),
             )
-        # Formulas/lookups/rollups and unsupported types fallback to text.
-        return "long_text", {}, False
+        if ftype in {"singleCollaborator", "createdBy", "lastModifiedBy"}:
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="auxiliary",
+                outputs=(
+                    FieldOutputPlan("", "text", {}, "collaborator_text"),
+                    FieldOutputPlan(" (raw)", "long_text", {}, "json_raw"),
+                ),
+                report_reason=f"{ftype} fields are migrated as readable text plus raw JSON snapshots.",
+            )
+        if ftype == "multipleCollaborators":
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="auxiliary",
+                outputs=(
+                    FieldOutputPlan("", "long_text", {}, "collaborators_text"),
+                    FieldOutputPlan(" (raw)", "long_text", {}, "json_raw"),
+                ),
+                report_reason="Multiple collaborator fields are migrated as readable text plus raw JSON snapshots.",
+            )
+        if ftype == "formula":
+            return self._plan_snapshot_field(
+                airtable_field_type=ftype,
+                result_type=_extract_result_type(options),
+                options=options,
+                default_reason="Formula fields are migrated as current-value snapshots.",
+            )
+        if ftype == "rollup":
+            return self._plan_rollup_field(options)
+        if ftype == "multipleLookupValues":
+            return self._plan_lookup_field(options)
+        if ftype == "barcode":
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "text", {}, "text_snapshot"),),
+                report_reason="Barcode fields are migrated as readable text snapshots.",
+            )
+        if ftype in {"button", "externalSyncSource"}:
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="auxiliary",
+                outputs=(
+                    FieldOutputPlan("", "text", {}, "text_snapshot"),
+                    FieldOutputPlan(" (raw)", "long_text", {}, "json_raw"),
+                ),
+                report_reason=f"{ftype} fields are migrated as readable text plus raw JSON snapshots.",
+            )
+        if ftype == "aiText":
+            return FieldMigrationPlan(
+                airtable_field_type=ftype,
+                fidelity="snapshot",
+                outputs=(FieldOutputPlan("", "long_text", {}, "text_snapshot"),),
+                report_reason="AI text fields are migrated as current-value snapshots.",
+            )
+        return FieldMigrationPlan(
+            airtable_field_type=ftype,
+            fidelity="snapshot",
+            outputs=(FieldOutputPlan("", "long_text", {}, "text_snapshot"),),
+            report_reason=f"Unsupported Airtable field type '{ftype}' was migrated as a long-text snapshot.",
+        )
 
     def create_baserow_database_if_needed(self, base: Dict[str, Any]) -> int:
         base_id = base["id"]
@@ -755,21 +1294,42 @@ class Migrator:
         self.base_names[base_id] = base_name
         base_report = self._base_report(base_id)
         existing = self.mapping.get_base(base_id)
-        if existing:
-            base_report["baserow_database_id"] = existing
-            return existing
         if self.config.dry_run:
+            if existing:
+                base_report["baserow_database_id"] = existing
+                return existing
             fake_id = self._next_fake_id()
             LOGGER.info("[dry-run] Would create Baserow database for base '%s'", base.get("name"))
             self.mapping.set_base(base_id, base.get("name", base_id), fake_id)
             base_report["baserow_database_id"] = fake_id
             return fake_id
+        existing_applications = None
+        if existing:
+            validated_database_id, existing_applications = self._validate_stored_database_mapping(base, existing)
+            if validated_database_id is not None:
+                base_report["baserow_database_id"] = validated_database_id
+                return validated_database_id
+        desired_database_name = _sanitize_name(base.get("name", base_id), base_id)
+        if existing_applications is None:
+            existing_applications = self.get_baserow_applications()
+        adopted_database = self._find_matching_baserow_database(existing_applications, desired_database_name)
+        if adopted_database is not None:
+            adopted_database_id = int(adopted_database["id"])
+            self.mapping.set_base(base_id, base.get("name", base_id), adopted_database_id)
+            base_report["baserow_database_id"] = adopted_database_id
+            LOGGER.info(
+                "Baserow database '%s' already exists in workspace %s (id=%s), adopting it",
+                desired_database_name,
+                self.config.baserow_workspace_id,
+                adopted_database_id,
+            )
+            return adopted_database_id
         payload = self.baserow_management_request(
             "POST",
             f"/api/applications/workspace/{self.config.baserow_workspace_id}/",
             {200, 201},
             {
-                "name": _sanitize_name(base.get("name", base_id), base_id),
+                "name": desired_database_name,
                 "type": "database",
             },
         )
@@ -792,21 +1352,47 @@ class Migrator:
             table.get("name", table["id"]),
         )
         existing = self.mapping.get_table(table["id"])
-        if existing:
-            table_report["baserow_table_id"] = existing
-            return existing
         if self.config.dry_run:
+            if existing:
+                table_report["baserow_table_id"] = existing
+                return existing
             fake_id = self._next_fake_id()
             LOGGER.info("[dry-run] Would create table '%s'", table.get("name"))
             self.mapping.set_table(airtable_base_id, table["id"], table.get("name", table["id"]), fake_id)
             table_report["baserow_table_id"] = fake_id
             return fake_id
+        existing_tables = None
+        if existing:
+            validated_table_id, existing_tables = self._validate_stored_table_mapping(
+                airtable_base_id,
+                db_id,
+                table,
+                existing,
+            )
+            if validated_table_id is not None:
+                table_report["baserow_table_id"] = validated_table_id
+                return validated_table_id
+        desired_table_name = _sanitize_name(table.get("name", table["id"]), table["id"])
+        if existing_tables is None:
+            existing_tables = self.get_baserow_tables(db_id)
+        adopted_table = self._find_matching_baserow_table(existing_tables, desired_table_name)
+        if adopted_table is not None:
+            adopted_table_id = int(adopted_table["id"])
+            self.mapping.set_table(airtable_base_id, table["id"], table.get("name", table["id"]), adopted_table_id)
+            table_report["baserow_table_id"] = adopted_table_id
+            LOGGER.info(
+                "Baserow table '%s' already exists in database %s (id=%s), adopting it",
+                desired_table_name,
+                db_id,
+                adopted_table_id,
+            )
+            return adopted_table_id
         payload = self.baserow_management_request(
             "POST",
             f"/api/database/tables/database/{db_id}/",
             {200, 201},
             {
-                "name": _sanitize_name(table.get("name", table["id"]), table["id"]),
+                "name": desired_table_name,
                 "data": [{"name": first_field_name, "type": "text"}],
             },
         )
@@ -822,11 +1408,173 @@ class Migrator:
             return payload
         return payload.get("results", [])
 
+    def get_baserow_applications(self) -> List[Dict[str, Any]]:
+        payload = self.baserow_management_request("GET", "/api/applications/", {200})
+        if isinstance(payload, list):
+            return payload
+        return payload.get("results", [])
+
+    def get_baserow_tables(self, database_id: int) -> List[Dict[str, Any]]:
+        payload = self.baserow_management_request("GET", f"/api/database/tables/database/{database_id}/", {200})
+        if isinstance(payload, list):
+            return payload
+        return payload.get("results", [])
+
     def get_baserow_views(self, table_id: int) -> List[Dict[str, Any]]:
         payload = self.baserow_management_request("GET", f"/api/database/views/table/{table_id}/", {200})
         if isinstance(payload, list):
             return payload
         return payload.get("results", [])
+
+    def _extract_application_workspace_id(self, application: Dict[str, Any]) -> Optional[int]:
+        workspace = application.get("workspace")
+        if isinstance(workspace, dict) and workspace.get("id") is not None:
+            try:
+                return int(workspace["id"])
+            except (TypeError, ValueError):
+                return None
+        group = application.get("group")
+        if isinstance(group, dict) and group.get("id") is not None:
+            try:
+                return int(group["id"])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _find_matching_baserow_database(
+        self,
+        applications: List[Dict[str, Any]],
+        database_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        candidates = [
+            application
+            for application in applications
+            if application.get("type") == "database"
+            and self._extract_application_workspace_id(application) == self.config.baserow_workspace_id
+            and application.get("name") == database_name
+        ]
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            LOGGER.warning(
+                "Multiple compatible Baserow databases named '%s' were found in workspace %s; adopting id=%s.",
+                database_name,
+                self.config.baserow_workspace_id,
+                candidates[0].get("id"),
+            )
+        return candidates[0]
+
+    def _find_matching_baserow_table(
+        self,
+        tables: List[Dict[str, Any]],
+        table_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        candidates = [table for table in tables if table.get("name") == table_name]
+        if not candidates:
+            return None
+        if len(candidates) > 1:
+            LOGGER.warning(
+                "Multiple compatible Baserow tables named '%s' were found; adopting id=%s.",
+                table_name,
+                candidates[0].get("id"),
+            )
+        return candidates[0]
+
+    def _validate_stored_database_mapping(
+        self,
+        base: Dict[str, Any],
+        stored_database_id: int,
+    ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+        applications = self.get_baserow_applications()
+        applications_by_id = {
+            int(application["id"]): application
+            for application in applications
+            if application.get("id") is not None
+        }
+        actual_application = applications_by_id.get(int(stored_database_id))
+        expected_name = _sanitize_name(base.get("name", base["id"]), base["id"])
+        actual_name = actual_application.get("name") if actual_application else None
+        actual_type = actual_application.get("type") if actual_application else None
+        actual_workspace_id = self._extract_application_workspace_id(actual_application or {})
+        if (
+            actual_application
+            and actual_type == "database"
+            and actual_workspace_id == self.config.baserow_workspace_id
+            and actual_name == expected_name
+        ):
+            self.mapping.set_base(base["id"], base.get("name", base["id"]), int(stored_database_id))
+            return int(stored_database_id), applications
+        LOGGER.warning(
+            "Stored database mapping for Airtable base '%s' is stale or mismatched; mapped Baserow database id=%s "
+            "resolved to name=%s type=%s workspace=%s. Revalidating against live workspace applications.",
+            base.get("name", base["id"]),
+            stored_database_id,
+            actual_name,
+            actual_type,
+            actual_workspace_id,
+        )
+        self._add_error(
+            "create_database",
+            "Stored Baserow database mapping rejected after live workspace verification",
+            {
+                "airtable_base_id": base["id"],
+                "airtable_base_name": base.get("name", base["id"]),
+                "baserow_database_id": stored_database_id,
+                "expected_baserow_database_name": expected_name,
+                "actual_baserow_database_name": actual_name,
+                "expected_workspace_id": self.config.baserow_workspace_id,
+                "actual_workspace_id": actual_workspace_id,
+                "actual_baserow_database_type": actual_type,
+            },
+        )
+        return None, applications
+
+    def _validate_stored_table_mapping(
+        self,
+        airtable_base_id: str,
+        database_id: int,
+        table: Dict[str, Any],
+        stored_table_id: int,
+    ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+        tables = self.get_baserow_tables(database_id)
+        tables_by_id = {
+            int(candidate["id"]): candidate
+            for candidate in tables
+            if candidate.get("id") is not None
+        }
+        actual_table = tables_by_id.get(int(stored_table_id))
+        expected_name = _sanitize_name(table.get("name", table["id"]), table["id"])
+        actual_name = actual_table.get("name") if actual_table else None
+        if actual_table and actual_name == expected_name:
+            self.mapping.set_table(
+                airtable_base_id,
+                table["id"],
+                table.get("name", table["id"]),
+                int(stored_table_id),
+            )
+            return int(stored_table_id), tables
+        LOGGER.warning(
+            "Stored table mapping for Airtable table '%s' is stale or mismatched; mapped Baserow table id=%s "
+            "resolved to name=%s in database %s. Revalidating against live database tables.",
+            table.get("name", table["id"]),
+            stored_table_id,
+            actual_name,
+            database_id,
+        )
+        self._add_error(
+            "create_table",
+            "Stored Baserow table mapping rejected after live database verification",
+            {
+                "airtable_base_id": airtable_base_id,
+                "airtable_table_id": table["id"],
+                "airtable_table_name": table.get("name", table["id"]),
+                "baserow_database_id": database_id,
+                "baserow_table_id": stored_table_id,
+                "expected_baserow_table_name": expected_name,
+                "actual_baserow_table_name": actual_name,
+            },
+        )
+        return None, tables
 
     def map_view_type(self, airtable_view_type: str) -> Tuple[Optional[str], bool]:
         """Map Airtable view type to Baserow view type.
@@ -960,19 +1708,102 @@ class Migrator:
         )
         return int(created_view_id), "created", live_views
 
-    def create_field_if_needed(
+    def _is_compatible_existing_field(
+        self,
+        existing_field: Dict[str, Any],
+        baserow_type: str,
+        extra: Dict[str, Any],
+    ) -> bool:
+        if existing_field.get("type") != baserow_type:
+            return False
+        if baserow_type == "number":
+            expected = extra.get("number_decimal_places")
+            actual = existing_field.get("number_decimal_places")
+            if expected is not None and actual is not None and int(actual) != int(expected):
+                return False
+        if baserow_type == "date":
+            expected = extra.get("date_include_time")
+            actual = existing_field.get("date_include_time")
+            if expected is not None and actual is not None and bool(actual) != bool(expected):
+                return False
+        return True
+
+    def _validate_stored_field_mapping(
         self,
         airtable_table_id: str,
-        baserow_table_id: int,
         airtable_field: Dict[str, Any],
+        stored_field: Dict[str, Any],
+        baserow_table_id: int,
         baserow_field_name: str,
         baserow_type: str,
         extra: Dict[str, Any],
-    ) -> Optional[int]:
-        known = {f["airtable_field_id"]: f for f in self.mapping.get_fields_for_table(airtable_table_id)}
-        if airtable_field["id"] in known and known[airtable_field["id"]]["baserow_field_id"]:
-            return int(known[airtable_field["id"]]["baserow_field_id"])
+    ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+        existing_fields = self.get_baserow_fields(baserow_table_id)
+        stored_field_id = int(stored_field["baserow_field_id"])
+        existing_fields_by_id = {int(field["id"]): field for field in existing_fields}
+        actual_field = existing_fields_by_id.get(stored_field_id)
+        actual_name = actual_field.get("name") if actual_field else None
+        actual_type = actual_field.get("type") if actual_field else None
 
+        if (
+            actual_field
+            and actual_name == baserow_field_name
+            and self._is_compatible_existing_field(actual_field, baserow_type, extra)
+        ):
+            self.mapping.set_field(
+                airtable_table_id,
+                airtable_field["id"],
+                airtable_field.get("name", airtable_field["id"]),
+                stored_field_id,
+                baserow_field_name,
+                baserow_type,
+                extra.get("linked_target_airtable_table_id"),
+            )
+            return stored_field_id, existing_fields
+
+        LOGGER.warning(
+            "Stored field mapping for Airtable field '%s' on table %s is stale or mismatched; mapped Baserow field "
+            "id=%s resolved to name=%s type=%s. Revalidating against live schema.",
+            airtable_field.get("name", airtable_field["id"]),
+            baserow_table_id,
+            stored_field_id,
+            actual_name,
+            actual_type,
+        )
+        self._add_error(
+            "create_field",
+            "Stored Baserow field mapping rejected after live schema verification",
+            {
+                "airtable_table_id": airtable_table_id,
+                "airtable_field_id": airtable_field["id"],
+                "field_name": airtable_field.get("name", airtable_field["id"]),
+                "baserow_table_id": baserow_table_id,
+                "baserow_field_id": stored_field_id,
+                "expected_baserow_field_name": baserow_field_name,
+                "actual_baserow_field_name": actual_name,
+                "expected_baserow_field_type": baserow_type,
+                "actual_baserow_field_type": actual_type,
+            },
+        )
+        self.mapping.set_field(
+            airtable_table_id,
+            airtable_field["id"],
+            airtable_field.get("name", airtable_field["id"]),
+            None,
+            baserow_field_name,
+            baserow_type,
+            extra.get("linked_target_airtable_table_id"),
+        )
+        return None, existing_fields
+
+    def _ensure_named_field(
+        self,
+        baserow_table_id: int,
+        baserow_field_name: str,
+        baserow_type: str,
+        extra: Dict[str, Any],
+        existing_fields: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[int, bool]:
         if self.config.dry_run:
             LOGGER.info(
                 "[dry-run] Would create field '%s' (%s) in table %s",
@@ -980,36 +1811,28 @@ class Migrator:
                 baserow_type,
                 baserow_table_id,
             )
-            fake_id = self._next_fake_id()
-            self.mapping.set_field(
-                airtable_table_id,
-                airtable_field["id"],
-                airtable_field.get("name", airtable_field["id"]),
-                fake_id,
-                baserow_field_name,
-                baserow_type,
-                extra.get("linked_target_airtable_table_id"),
-            )
-            return fake_id
+            return self._next_fake_id(), True
 
-        existing_fields = self.get_baserow_fields(baserow_table_id)
-        for ef in existing_fields:
-            if ef.get("name") == baserow_field_name:
-                field_id = int(ef["id"])
-                LOGGER.info(
-                    "Field '%s' already exists in Baserow table %s (id=%s), adopting it",
-                    baserow_field_name, baserow_table_id, field_id,
+        if existing_fields is None:
+            existing_fields = self.get_baserow_fields(baserow_table_id)
+        for existing_field in existing_fields:
+            if existing_field.get("name") != baserow_field_name:
+                continue
+            if not self._is_compatible_existing_field(existing_field, baserow_type, extra):
+                raise RuntimeError(
+                    "Existing Baserow field mismatch for "
+                    f"'{baserow_field_name}': expected type={baserow_type}, "
+                    f"actual type={existing_field.get('type')}"
                 )
-                self.mapping.set_field(
-                    airtable_table_id,
-                    airtable_field["id"],
-                    airtable_field.get("name", airtable_field["id"]),
-                    field_id,
-                    baserow_field_name,
-                    baserow_type,
-                    extra.get("linked_target_airtable_table_id"),
-                )
-                return field_id
+            field_id = int(existing_field["id"])
+            LOGGER.info(
+                "Field '%s' already exists in Baserow table %s (id=%s, type=%s), adopting it",
+                baserow_field_name,
+                baserow_table_id,
+                field_id,
+                baserow_type,
+            )
+            return field_id, False
 
         body = {"name": baserow_field_name, "type": baserow_type}
         if baserow_type in {"single_select", "multiple_select"}:
@@ -1025,7 +1848,55 @@ class Migrator:
             {200, 201},
             body,
         )
-        field_id = int(payload["id"])
+        return int(payload["id"]), True
+
+    def ensure_auxiliary_field(
+        self,
+        baserow_table_id: int,
+        baserow_field_name: str,
+        baserow_type: str,
+        extra: Dict[str, Any],
+    ) -> Tuple[int, bool]:
+        field_id, created_new = self._ensure_named_field(
+            baserow_table_id=baserow_table_id,
+            baserow_field_name=baserow_field_name,
+            baserow_type=baserow_type,
+            extra=extra,
+        )
+        return field_id, created_new
+
+    def create_field_if_needed(
+        self,
+        airtable_table_id: str,
+        baserow_table_id: int,
+        airtable_field: Dict[str, Any],
+        baserow_field_name: str,
+        baserow_type: str,
+        extra: Dict[str, Any],
+    ) -> Optional[int]:
+        known = {f["airtable_field_id"]: f for f in self.mapping.get_fields_for_table(airtable_table_id)}
+        existing_fields = None
+        known_field = known.get(airtable_field["id"])
+        if known_field and known_field["baserow_field_id"]:
+            validated_field_id, existing_fields = self._validate_stored_field_mapping(
+                airtable_table_id=airtable_table_id,
+                airtable_field=airtable_field,
+                stored_field=known_field,
+                baserow_table_id=baserow_table_id,
+                baserow_field_name=baserow_field_name,
+                baserow_type=baserow_type,
+                extra=extra,
+            )
+            if validated_field_id is not None:
+                return validated_field_id
+
+        field_id, created_new_field = self._ensure_named_field(
+            baserow_table_id=baserow_table_id,
+            baserow_field_name=baserow_field_name,
+            baserow_type=baserow_type,
+            extra=extra,
+            existing_fields=existing_fields,
+        )
         self.mapping.set_field(
             airtable_table_id,
             airtable_field["id"],
@@ -1035,10 +1906,11 @@ class Migrator:
             baserow_type,
             extra.get("linked_target_airtable_table_id"),
         )
-        base_id = self.mapping.get_base_id_for_table(airtable_table_id) or airtable_table_id
-        table_report = self._table_report(base_id, airtable_table_id)
-        table_report["fields_created"] += 1
-        LOGGER.info("Created field '%s' in Baserow table %s", baserow_field_name, baserow_table_id)
+        if created_new_field:
+            base_id = self.mapping.get_base_id_for_table(airtable_table_id) or airtable_table_id
+            table_report = self._table_report(base_id, airtable_table_id)
+            table_report["fields_created"] += 1
+            LOGGER.info("Created field '%s' in Baserow table %s", baserow_field_name, baserow_table_id)
         return field_id
 
     def create_link_field_if_needed(
@@ -1477,16 +2349,17 @@ class Migrator:
         self.report["totals"]["files_uploaded_to_baserow"] += 1
         return resp.json()
 
-    def _transform_value(
+    def _transform_output_value(
         self,
-        baserow_type: str,
+        output: ResolvedFieldOutput,
         value: Any,
         record_id: str,
         table_report: Dict[str, Any],
     ) -> Any:
         if value is None:
             return None
-        if baserow_type == "file":
+        transform = output.transform
+        if transform == "file":
             uploaded_files = []
             for attachment in value or []:
                 local_path = self._download_attachment(attachment, record_id, table_report)
@@ -1503,18 +2376,60 @@ class Migrator:
                         {"record_id": record_id, "file_path": str(local_path)},
                     )
             return uploaded_files
-        if baserow_type in {"single_select"}:
+        if transform in {"text", "text_snapshot", "text_projection"}:
+            return _render_readable_text_value(value)
+        if transform == "collaborator_text":
+            projected = _project_collaborator_value(value)
+            return projected if projected is not None else _render_readable_text_value(value)
+        if transform == "collaborators_text":
+            if isinstance(value, list):
+                projected_values = [
+                    projected
+                    for projected in (_project_collaborator_value(item) for item in value)
+                    if projected is not None
+                ]
+                if projected_values:
+                    return ", ".join(projected_values)
+            return _render_readable_text_value(value)
+        if transform == "json_raw":
+            return _serialize_json_value(value)
+        if transform == "single_select":
             v = str(value).strip() if value is not None else None
             return v if v else None
-        if baserow_type in {"multiple_select"}:
+        if transform == "multiple_select":
             return [str(v) for v in (value or []) if str(v).strip()]
-        if baserow_type == "number":
+        if transform == "number":
             return value
-        if baserow_type == "boolean":
+        if transform == "boolean":
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"", "0", "false", "no", "n", "off"}:
+                    return False
+                if normalized in {"1", "true", "yes", "y", "on"}:
+                    return True
             return bool(value)
+        if transform == "date":
+            return str(value)
         if isinstance(value, (dict, list)):
-            return json.dumps(value, ensure_ascii=True)
+            return _serialize_json_value(value)
         return value
+
+    def _transform_field_value(
+        self,
+        spec: ResolvedFieldMigrationSpec,
+        value: Any,
+        record_id: str,
+        table_report: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        row_payload: Dict[str, Any] = {}
+        for output in spec.outputs:
+            row_payload[output.baserow_field_name] = self._transform_output_value(
+                output=output,
+                value=value,
+                record_id=record_id,
+                table_report=table_report,
+            )
+        return row_payload
 
     def _create_rows_batch(
         self,
@@ -1801,13 +2716,15 @@ class Migrator:
         if not baserow_table_id:
             raise RuntimeError(f"Missing Baserow table mapping for Airtable table {airtable_table_id}")
 
-        fields_meta = self.mapping.get_fields_for_table(airtable_table_id)
+        field_specs = self._field_specs.get(airtable_table_id, {})
+        if not field_specs:
+            raise RuntimeError(f"Missing resolved field specifications for Airtable table {airtable_table_id}")
         link_field_names = {
-            item["airtable_field_name"]
-            for item in fields_meta
-            if item["baserow_field_type"] == "link_row"
+            item.airtable_field_name
+            for item in field_specs.values()
+            if item.defer_link
         }
-        fields_by_airtable_name = {item["airtable_field_name"]: item for item in fields_meta}
+        fields_by_airtable_name = {item.airtable_field_name: item for item in field_specs.values()}
 
         created = 0
         skipped = 0
@@ -1823,11 +2740,16 @@ class Migrator:
             for source_name, source_value in source_fields.items():
                 if source_name in link_field_names:
                     continue
-                mapped = fields_by_airtable_name.get(source_name)
-                if not mapped:
+                mapped_spec = fields_by_airtable_name.get(source_name)
+                if not mapped_spec:
                     continue
-                row_payload[mapped["baserow_field_name"]] = self._transform_value(
-                    mapped["baserow_field_type"], source_value, airtable_record_id, table_report
+                row_payload.update(
+                    self._transform_field_value(
+                        mapped_spec,
+                        source_value,
+                        airtable_record_id,
+                        table_report,
+                    )
                 )
 
             if self.config.dry_run:
@@ -1934,6 +2856,7 @@ class Migrator:
             if not baserow_row_id:
                 continue
             patch_payload: Dict[str, Any] = {}
+            unresolved_link_dependencies: List[Dict[str, Any]] = []
             source_fields = record.get("fields", {})
             for source_name, mapped in link_fields_by_name.items():
                 linked_ids = source_fields.get(source_name, [])
@@ -1943,12 +2866,40 @@ class Migrator:
                 if not target_airtable_table_id:
                     continue
                 target_row_ids = []
+                missing_linked_record_ids = []
                 for linked_airtable_record_id in linked_ids:
                     target_row_id = self.mapping.get_record(target_airtable_table_id, linked_airtable_record_id)
                     if target_row_id:
                         target_row_ids.append(target_row_id)
+                    else:
+                        missing_linked_record_ids.append(linked_airtable_record_id)
+                if missing_linked_record_ids:
+                    unresolved_link_dependencies.append(
+                        {
+                            "airtable_field_id": mapped["airtable_field_id"],
+                            "field_name": source_name,
+                            "linked_target_airtable_table_id": target_airtable_table_id,
+                            "missing_linked_airtable_record_ids": missing_linked_record_ids,
+                        }
+                    )
+                    break
                 real_name = actual_link_field_names.get(mapped["baserow_field_id"], mapped["baserow_field_name"])
                 patch_payload[real_name] = target_row_ids
+
+            if unresolved_link_dependencies:
+                self.report["totals"]["link_patches_failed"] += 1
+                self._add_error(
+                    "patch_links",
+                    "Skipped link patch because one or more linked target rows are missing mappings",
+                    {
+                        "airtable_table_id": airtable_table_id,
+                        "airtable_record_id": record["id"],
+                        "baserow_table_id": baserow_table_id,
+                        "baserow_row_id": baserow_row_id,
+                        "unresolved_link_dependencies": unresolved_link_dependencies,
+                    },
+                )
+                continue
 
             if not patch_payload:
                 continue
@@ -1979,6 +2930,7 @@ class Migrator:
 
     def create_schema(self) -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
         discovered = self.discover_workspace_bases()
+        self._field_specs = {}
         self.report["totals"]["bases_discovered"] = len(discovered)
         if not discovered:
             LOGGER.warning("No bases found for workspace '%s'", self.config.airtable_workspace_id)
@@ -2022,33 +2974,48 @@ class Migrator:
                 used_names = {first_field_name}
                 for field in fields:
                     desired_name = _sanitize_name(field.get("name", "Field"), "Field")
-                    if desired_name == first_field_name:
-                        baserow_field_name = first_field_name
-                    else:
-                        baserow_field_name = _unique_name(desired_name, used_names)
-                    baserow_type, extra, defer = self.map_field_definition(field)
-                    if field.get("id") == table.get("primaryFieldId"):
+                    is_primary_field = field.get("id") == table.get("primaryFieldId")
+                    resolved_spec = self._resolve_field_migration_spec(
+                        field=field,
+                        plan=self.map_field_definition(field),
+                        desired_name=desired_name,
+                        first_field_name=first_field_name,
+                        used_names=used_names,
+                        is_primary=is_primary_field,
+                    )
+                    main_output = resolved_spec.outputs[0]
+                    if is_primary_field:
                         self.mapping.set_field(
                             table["id"],
                             field["id"],
                             field.get("name", field["id"]),
                             primary_baserow_id,
-                            baserow_field_name,
-                            "text",
+                            main_output.baserow_field_name,
+                            main_output.baserow_field_type,
                             None,
                         )
                         known_fields_by_id[field["id"]] = {
                             "airtable_field_id": field["id"],
                             "airtable_field_name": field.get("name", field["id"]),
                             "baserow_field_id": primary_baserow_id,
-                            "baserow_field_name": baserow_field_name,
-                            "baserow_field_type": "text",
+                            "baserow_field_name": main_output.baserow_field_name,
+                            "baserow_field_type": main_output.baserow_field_type,
                             "linked_target_airtable_table_id": None,
                             "reverse_baserow_field_id": None,
                         }
+                        for output in resolved_spec.outputs[1:]:
+                            _field_id, created_new = self.ensure_auxiliary_field(
+                                baserow_table_id=baserow_table_id,
+                                baserow_field_name=output.baserow_field_name,
+                                baserow_type=output.baserow_field_type,
+                                extra=output.extra,
+                            )
+                            if created_new:
+                                self._table_report(base_id, table["id"], table.get("name", table["id"]))["fields_created"] += 1
+                        self._record_field_mapping(base_id, table["id"], table.get("name", table["id"]), resolved_spec)
                         continue
-                    if defer:
-                        linked_target = extra.get("linked_target_airtable_table_id")
+                    if resolved_spec.defer_link:
+                        linked_target = resolved_spec.linked_target_airtable_table_id
                         if not linked_target:
                             LOGGER.warning("Skipping link field %s: missing linked table metadata", field.get("name"))
                             self.report["totals"]["fields_failed"] += 1
@@ -2074,9 +3041,9 @@ class Migrator:
                                 table["id"],
                                 baserow_table_id,
                                 field,
-                                baserow_field_name,
+                                main_output.baserow_field_name,
                                 linked_target,
-                                extra.get("inverse_link_airtable_field_id"),
+                                resolved_spec.inverse_link_airtable_field_id,
                             )
                         )
                         known_field = known_fields_by_id.get(field["id"], {})
@@ -2085,7 +3052,7 @@ class Migrator:
                             field["id"],
                             field.get("name", field["id"]),
                             known_field.get("baserow_field_id"),
-                            baserow_field_name,
+                            main_output.baserow_field_name,
                             "link_row",
                             linked_target,
                             known_field.get("reverse_baserow_field_id"),
@@ -2094,27 +3061,43 @@ class Migrator:
                             "airtable_field_id": field["id"],
                             "airtable_field_name": field.get("name", field["id"]),
                             "baserow_field_id": known_field.get("baserow_field_id"),
-                            "baserow_field_name": baserow_field_name,
+                            "baserow_field_name": main_output.baserow_field_name,
                             "baserow_field_type": "link_row",
                             "linked_target_airtable_table_id": linked_target,
                             "reverse_baserow_field_id": known_field.get("reverse_baserow_field_id"),
                         }
+                        self._field_specs.setdefault(table["id"], {})[resolved_spec.airtable_field_id] = resolved_spec
                         continue
                     try:
                         self.create_field_if_needed(
                             table["id"],
                             baserow_table_id,
                             field,
-                            baserow_field_name,
-                            baserow_type,
-                            extra,
+                            main_output.baserow_field_name,
+                            main_output.baserow_field_type,
+                            main_output.extra,
                         )
+                        for output in resolved_spec.outputs[1:]:
+                            _field_id, created_new = self.ensure_auxiliary_field(
+                                baserow_table_id=baserow_table_id,
+                                baserow_field_name=output.baserow_field_name,
+                                baserow_type=output.baserow_field_type,
+                                extra=output.extra,
+                            )
+                            if created_new:
+                                self._table_report(base_id, table["id"], table.get("name", table["id"]))["fields_created"] += 1
+                        self._record_field_mapping(base_id, table["id"], table.get("name", table["id"]), resolved_spec)
                     except Exception as exc:
                         self.report["totals"]["fields_failed"] += 1
                         self._add_error(
                             "create_field",
                             str(exc),
-                            {"table_id": table["id"], "field_name": field.get("name"), "field_type": baserow_type},
+                            {
+                                "table_id": table["id"],
+                                "field_name": field.get("name"),
+                                "field_type": main_output.baserow_field_type,
+                                "airtable_field_type": resolved_spec.airtable_field_type,
+                            },
                         )
 
         # Second pass for relation fields.
@@ -2168,6 +3151,12 @@ class Migrator:
                             "field_name": field.get("name"),
                         },
                     )
+                    self._finalize_field_mapping(
+                        airtable_table_id,
+                        field["id"],
+                        status="failed",
+                        status_reason="Target table was not available for relation field creation.",
+                    )
                     continue
 
                 if field["id"] in pending_ambiguous_reverse_link_claims:
@@ -2194,6 +3183,12 @@ class Migrator:
                             "ambiguity": ambiguity,
                         },
                     )
+                    self._finalize_field_mapping(
+                        airtable_table_id,
+                        field["id"],
+                        status="failed",
+                        status_reason="Reverse link claim was ambiguous, so the relation field was not finalized.",
+                    )
                     continue
 
                 if field["id"] in pending_reverse_link_claims:
@@ -2212,6 +3207,7 @@ class Migrator:
                         "Mapped reverse link field '%s' (id=%s) in table %s (auto-created by Baserow)",
                         baserow_field_name, claim.reverse_field_id, baserow_table_id,
                     )
+                    self._finalize_field_mapping(airtable_table_id, field["id"])
                     continue
 
                 if not inverse_link_airtable_field_id:
@@ -2240,6 +3236,12 @@ class Migrator:
                                 "target_baserow_table_id": target_baserow_table_id,
                                 "unclaimed_reverse_field_ids": unclaimed_reverse_field_ids[:],
                             },
+                        )
+                        self._finalize_field_mapping(
+                            airtable_table_id,
+                            field["id"],
+                            status="failed",
+                            status_reason="Existing auto-created reverse field could not be safely matched to this Airtable inverse field.",
                         )
                         continue
 
@@ -2271,6 +3273,12 @@ class Migrator:
                         None, baserow_field_name, "link_row", linked_target,
                         None,
                     )
+                    self._finalize_field_mapping(
+                        airtable_table_id,
+                        field["id"],
+                        status="failed",
+                        status_reason="Cross-database Airtable links are not supported in Baserow.",
+                    )
                     continue
 
                 result = self.create_link_field_if_needed(
@@ -2282,7 +3290,14 @@ class Migrator:
                     linked_target,
                 )
                 if not result:
+                    self._finalize_field_mapping(
+                        airtable_table_id,
+                        field["id"],
+                        status="failed",
+                        status_reason="Relation field could not be created or adopted against the live Baserow schema.",
+                    )
                     continue
+                self._finalize_field_mapping(airtable_table_id, field["id"])
                 if baserow_table_id != target_baserow_table_id:
                     reverse_claim_key = (target_baserow_table_id, baserow_table_id)
                     if result.reverse_field_id is None:
@@ -2382,6 +3397,12 @@ class Migrator:
                     "create_link_field",
                     str(exc),
                     {"table_id": airtable_table_id, "field_name": field.get("name"), "linked_target": linked_target},
+                )
+                self._finalize_field_mapping(
+                    airtable_table_id,
+                    field["id"],
+                    status="failed",
+                    status_reason="An exception interrupted deferred relation field processing.",
                 )
 
         for claimed_airtable_field_id, claim in pending_reverse_link_claims.items():
