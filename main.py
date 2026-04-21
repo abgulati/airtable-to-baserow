@@ -2022,20 +2022,10 @@ class Migrator:
             actual_name,
             actual_type,
         )
-        self._add_error(
-            "create_field",
-            "Stored Baserow field mapping rejected after live schema verification",
-            {
-                "airtable_table_id": airtable_table_id,
-                "airtable_field_id": airtable_field["id"],
-                "field_name": airtable_field.get("name", airtable_field["id"]),
-                "baserow_table_id": baserow_table_id,
-                "baserow_field_id": stored_field_id,
-                "expected_baserow_field_name": baserow_field_name,
-                "actual_baserow_field_name": actual_name,
-                "expected_baserow_field_type": baserow_type,
-                "actual_baserow_field_type": actual_type,
-            },
+        LOGGER.info(
+            "Discarding stale stored field mapping for Airtable field '%s' on table %s and continuing with live field revalidation.",
+            airtable_field.get("name", airtable_field["id"]),
+            baserow_table_id,
         )
         self.mapping.set_field(
             airtable_table_id,
