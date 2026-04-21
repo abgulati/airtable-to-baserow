@@ -318,6 +318,10 @@ class PendingReverseLinkClaim:
     reverse_field_id: int
 
 
+class RowTransformError(RuntimeError):
+    pass
+
+
 class MappingStore:
     def __init__(self, db_path: Path, in_memory: bool = False) -> None:
         if in_memory:
@@ -699,6 +703,7 @@ class Migrator:
                 "fields_snapshot": 0,
                 "fields_auxiliary": 0,
                 "fields_unsupported": 0,
+                "link_patch_batch_fallbacks": 0,
                 "link_patches_failed": 0,
                 "views_total": 0,
                 "views_migrated": 0,
@@ -762,6 +767,7 @@ class Migrator:
                 "files_uploaded_to_baserow": 0,
                 "files_failed": 0,
                 "rows_failed": 0,
+                "link_patch_batch_fallbacks": 0,
                 "views_total": 0,
                 "views_migrated": 0,
                 "views_created": 0,
@@ -2635,6 +2641,7 @@ class Migrator:
         transform = output.transform
         if transform == "file":
             uploaded_files = []
+            failed_uploads = 0
             for attachment in value or []:
                 local_path = self._download_attachment(attachment, record_id, table_report)
                 if not local_path:
@@ -2642,6 +2649,7 @@ class Migrator:
                 try:
                     uploaded_files.append(self._upload_file_to_baserow(local_path, table_report))
                 except Exception as exc:
+                    failed_uploads += 1
                     table_report["files_failed"] += 1
                     self.report["totals"]["files_failed"] += 1
                     self._add_error(
@@ -2649,6 +2657,10 @@ class Migrator:
                         str(exc),
                         {"record_id": record_id, "file_path": str(local_path)},
                     )
+            if failed_uploads:
+                raise RowTransformError(
+                    f"Attachment handling failed for record {record_id}; {failed_uploads} file(s) could not be uploaded."
+                )
             return uploaded_files
         if transform in {"text", "text_snapshot", "text_projection"}:
             return _render_readable_text_value(value)
@@ -2875,6 +2887,7 @@ class Migrator:
         self,
         baserow_table_id: int,
         airtable_table_id: str,
+        table_report: Dict[str, Any],
         batch: List[Tuple[int, Dict[str, Any]]],
     ) -> int:
         """Patch link values via the Baserow batch update API.
@@ -2895,15 +2908,16 @@ class Migrator:
             return len(batch)
         except Exception as batch_exc:
             status_code = _extract_http_status(batch_exc)
+            table_report["link_patch_batch_fallbacks"] += 1
+            self.report["totals"]["link_patch_batch_fallbacks"] += 1
             LOGGER.warning(
-                "Batch link patch for table %s failed and will not be replayed automatically to avoid duplicate updates: %s",
+                "Batch link patch for table %s failed; falling back to per-row patches: %s",
                 baserow_table_id,
                 str(batch_exc)[:200],
             )
-            self.report["totals"]["link_patches_failed"] += len(batch)
             self._add_error(
-                "patch_links_batch",
-                "Batch link patch failed and was not replayed automatically to avoid duplicate writes.",
+                "patch_links_batch_fallback",
+                "Batch link patch failed; retrying each row individually.",
                 {
                     "airtable_table_id": airtable_table_id,
                     "baserow_table_id": baserow_table_id,
@@ -2912,7 +2926,11 @@ class Migrator:
                     "error": str(batch_exc)[:300],
                 },
             )
-            return 0
+            return self._patch_links_individually(
+                baserow_table_id,
+                airtable_table_id,
+                batch,
+            )
 
     def _patch_links_individually(
         self,
@@ -3116,20 +3134,33 @@ class Migrator:
             source_fields = record.get("fields", {})
             row_payload: Dict[str, Any] = {}
 
-            for source_name, source_value in source_fields.items():
-                if source_name in link_field_names:
-                    continue
-                mapped_spec = fields_by_airtable_name.get(source_name)
-                if not mapped_spec:
-                    continue
-                row_payload.update(
-                    self._transform_field_value(
-                        mapped_spec,
-                        source_value,
-                        airtable_record_id,
-                        table_report,
+            try:
+                for source_name, source_value in source_fields.items():
+                    if source_name in link_field_names:
+                        continue
+                    mapped_spec = fields_by_airtable_name.get(source_name)
+                    if not mapped_spec:
+                        continue
+                    row_payload.update(
+                        self._transform_field_value(
+                            mapped_spec,
+                            source_value,
+                            airtable_record_id,
+                            table_report,
+                        )
                     )
+            except Exception as exc:
+                self.report["totals"]["rows_failed"] += 1
+                table_report["rows_failed"] += 1
+                self._add_error(
+                    "transform_row",
+                    str(exc)[:300],
+                    {
+                        "airtable_table_id": airtable_table_id,
+                        "airtable_record_id": airtable_record_id,
+                    },
                 )
+                continue
             row_payload[row_identity_field_name] = airtable_record_id
 
             if self.config.dry_run:
@@ -3303,14 +3334,20 @@ class Migrator:
             pending_batch.append((baserow_row_id, patch_payload))
             if len(pending_batch) >= self.config.batch_size:
                 patched += self._patch_links_batch(
-                    baserow_table_id, airtable_table_id, pending_batch
+                    baserow_table_id,
+                    airtable_table_id,
+                    table_report,
+                    pending_batch,
                 )
                 pending_batch = []
                 LOGGER.info("Table %s: patched %s rows with link values so far", airtable_table_id, patched)
 
         if pending_batch:
             patched += self._patch_links_batch(
-                baserow_table_id, airtable_table_id, pending_batch
+                baserow_table_id,
+                airtable_table_id,
+                table_report,
+                pending_batch,
             )
         table_report["rows_patched_links"] += patched
         self.report["totals"]["rows_patch_links"] += patched
@@ -3927,11 +3964,12 @@ class Migrator:
             if error_count:
                 LOGGER.warning(
                     "Migration completed with %s error(s). "
-                    "rows_failed=%s, fields_failed=%s, link_patches_failed=%s, views_failed=%s. "
+                    "rows_failed=%s, fields_failed=%s, link_patch_batch_fallbacks=%s, link_patches_failed=%s, views_failed=%s. "
                     "See migration report for details.",
                     error_count,
                     totals["rows_failed"],
                     totals["fields_failed"],
+                    totals["link_patch_batch_fallbacks"],
                     totals["link_patches_failed"],
                     totals["views_failed"],
                 )
