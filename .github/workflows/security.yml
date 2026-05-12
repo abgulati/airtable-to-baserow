@@ -26,7 +26,7 @@ jobs:
       contents: read
     steps:
       - name: Dependency Review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
 
 
   # Dependency vulnerability audit with pip-audit - exits with code 1 if ANY vulnerability is found (default behavior)
